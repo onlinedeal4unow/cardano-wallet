@@ -1110,7 +1110,7 @@ spec = parallel $ do
                         (x :: ApiTransaction ('Testnet 0))
                     , metadata = metadata
                         (x :: ApiTransaction ('Testnet 0))
-                    , isValidScript = isValidScript
+                    , scriptValidity = scriptValidity
                         (x :: ApiTransaction ('Testnet 0))
                     }
             in
