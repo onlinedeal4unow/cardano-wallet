@@ -8,29 +8,55 @@
 --
 
 module Test.QuickCheck.Extra
-    ( genMapWith
+    (
+      -- * Generation
+      genMapWith
     , genSized2
     , genSized2With
-    , interleaveRoundRobin
-    , liftShrink6
     , reasonablySized
+
+      -- * Shrinking
+    , liftShrink3
+    , liftShrink7
     , shrinkInterleaved
     , shrinkMapWith
+
+      -- * Counterexamples
+    , report
+    , verify
+
+      -- * Combinators
+    , NotNull (..)
+
+      -- * Utilities
+    , interleaveRoundRobin
+
     ) where
 
 import Prelude
 
 import Data.Map.Strict
     ( Map )
+import Fmt
+    ( indentF, (+|), (|+) )
 import Test.QuickCheck
-    ( Gen
+    ( Arbitrary (..)
+    , Gen
+    , Property
+    , Testable
+    , counterexample
     , liftArbitrary2
     , liftShrink2
     , listOf
+    , property
     , scale
     , shrinkList
     , shrinkMapBy
+    , suchThat
+    , (.&&.)
     )
+import Test.Utils.Pretty
+    ( pShowBuilder )
 
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
@@ -94,25 +120,42 @@ genSized2 genA genB = (,)
 genSized2With :: (a -> b -> c) -> Gen a -> Gen b -> Gen c
 genSized2With f genA genB = uncurry f <$> genSized2 genA genB
 
--- | Similar to 'liftShrink2', but applicable to 6-tuples.
+-- | Similar to 'liftShrink2', but applicable to 3-tuples.
 --
-liftShrink6
+liftShrink3
+    :: (a1 -> [a1])
+    -> (a2 -> [a2])
+    -> (a3 -> [a3])
+    -> (a1, a2, a3)
+    -> [(a1, a2, a3)]
+liftShrink3 s1 s2 s3 (a1, a2, a3) =
+    interleaveRoundRobin
+    [ [ (a1', a2 , a3 ) | a1' <- s1 a1 ]
+    , [ (a1 , a2', a3 ) | a2' <- s2 a2 ]
+    , [ (a1 , a2 , a3') | a3' <- s3 a3 ]
+    ]
+
+-- | Similar to 'liftShrink2', but applicable to 7-tuples.
+--
+liftShrink7
     :: (a1 -> [a1])
     -> (a2 -> [a2])
     -> (a3 -> [a3])
     -> (a4 -> [a4])
     -> (a5 -> [a5])
     -> (a6 -> [a6])
-    -> (a1, a2, a3, a4, a5, a6)
-    -> [(a1, a2, a3, a4, a5, a6)]
-liftShrink6 s1 s2 s3 s4 s5 s6 (a1, a2, a3, a4, a5, a6) =
+    -> (a7 -> [a7])
+    -> (a1, a2, a3, a4, a5, a6, a7)
+    -> [(a1, a2, a3, a4, a5, a6, a7)]
+liftShrink7 s1 s2 s3 s4 s5 s6 s7 (a1, a2, a3, a4, a5, a6, a7) =
     interleaveRoundRobin
-    [ [ (a1', a2 , a3 , a4 , a5 , a6 ) | a1' <- s1 a1 ]
-    , [ (a1 , a2', a3 , a4 , a5 , a6 ) | a2' <- s2 a2 ]
-    , [ (a1 , a2 , a3', a4 , a5 , a6 ) | a3' <- s3 a3 ]
-    , [ (a1 , a2 , a3 , a4', a5 , a6 ) | a4' <- s4 a4 ]
-    , [ (a1 , a2 , a3 , a4 , a5', a6 ) | a5' <- s5 a5 ]
-    , [ (a1 , a2 , a3 , a4 , a5 , a6') | a6' <- s6 a6 ]
+    [ [ (a1', a2 , a3 , a4 , a5 , a6 , a7 ) | a1' <- s1 a1 ]
+    , [ (a1 , a2', a3 , a4 , a5 , a6 , a7 ) | a2' <- s2 a2 ]
+    , [ (a1 , a2 , a3', a4 , a5 , a6 , a7 ) | a3' <- s3 a3 ]
+    , [ (a1 , a2 , a3 , a4', a5 , a6 , a7 ) | a4' <- s4 a4 ]
+    , [ (a1 , a2 , a3 , a4 , a5', a6 , a7 ) | a5' <- s5 a5 ]
+    , [ (a1 , a2 , a3 , a4 , a5 , a6', a7 ) | a6' <- s6 a6 ]
+    , [ (a1 , a2 , a3 , a4 , a5 , a6 , a7') | a7' <- s7 a7 ]
     ]
 
 -- Interleaves the given lists together in round-robin order.
@@ -164,3 +207,36 @@ shrinkMapWith shrinkKey shrinkValue
     = shrinkMapBy Map.fromList Map.toList
     $ shrinkList
     $ liftShrink2 shrinkKey shrinkValue
+
+--------------------------------------------------------------------------------
+-- Counterexamples
+--------------------------------------------------------------------------------
+
+-- | Adds a named variable to the counterexample output of a property.
+--
+-- On failure, uses pretty-printing to show the contents of the variable.
+--
+report :: (Show a, Testable prop) => a -> String -> prop -> Property
+report a name = counterexample $
+    "" +|name|+ ":\n" +|indentF 4 (pShowBuilder a) |+ ""
+
+-- | Adds a named condition to a property.
+--
+-- On failure, reports the name of the condition that failed.
+--
+verify :: Bool -> String -> Property -> Property
+verify condition conditionTitle =
+    (.&&.) (counterexample counterexampleText $ property condition)
+  where
+    counterexampleText = "Condition violated: " <> conditionTitle
+
+--------------------------------------------------------------------------------
+-- Non-null values
+--------------------------------------------------------------------------------
+
+newtype NotNull a = NotNull { unNotNull :: a }
+    deriving (Eq, Show)
+
+instance (Arbitrary a, Eq a, Monoid a) => Arbitrary (NotNull a) where
+    arbitrary = NotNull <$> arbitrary `suchThat` (/= mempty)
+    shrink (NotNull u) = NotNull <$> filter (/= mempty) (shrink u)

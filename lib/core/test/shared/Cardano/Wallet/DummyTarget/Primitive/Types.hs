@@ -48,7 +48,13 @@ import Cardano.Wallet.Primitive.Types.Hash
 import Cardano.Wallet.Primitive.Types.RewardAccount
     ( RewardAccount (..) )
 import Cardano.Wallet.Primitive.Types.Tx
-    ( Tx (..), TxIn (..), TxMetadata (..), TxOut (..), TxSize (..) )
+    ( Tx (..)
+    , TxIn (..)
+    , TxMetadata (..)
+    , TxOut (..)
+    , TxScriptValidity (..)
+    , TxSize (..)
+    )
 import Data.Coerce
     ( coerce )
 import Data.Functor.Identity
@@ -120,6 +126,7 @@ dummyProtocolParameters = ProtocolParameters
     , stakeKeyDeposit = Coin 0
     , eras = emptyEraInfo
     , maximumCollateralInputCount = 3
+    , executionUnitPrices = Nothing
     }
 
 -- | Construct a @Tx@, computing its hash using the dummy @mkTxId@.
@@ -130,8 +137,9 @@ mkTx
     -> [TxOut]
     -> Map RewardAccount Coin
     -> Maybe TxMetadata
+    -> Maybe TxScriptValidity
     -> Tx
-mkTx fees ins cins outs wdrls md =
+mkTx fees ins cins outs wdrls md validity =
     Tx
       { txId = (mkTxId ins outs wdrls md)
       , fee = fees
@@ -140,6 +148,7 @@ mkTx fees ins cins outs wdrls md =
       , outputs = outs
       , withdrawals = wdrls
       , metadata = md
+      , scriptValidity = validity
       }
 
 -- | txId calculation for testing purposes.

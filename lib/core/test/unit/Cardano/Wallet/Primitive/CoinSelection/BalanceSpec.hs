@@ -28,11 +28,14 @@ import Cardano.Wallet.Primitive.CoinSelection.Balance
     , InsufficientMinCoinValueError (..)
     , MakeChangeCriteria (..)
     , OutputsInsufficientError (..)
+    , RunSelectionParams (..)
     , SelectionCriteria (..)
+    , SelectionDelta (..)
     , SelectionError (..)
     , SelectionInsufficientError (..)
     , SelectionLens (..)
-    , SelectionLimit (..)
+    , SelectionLimit
+    , SelectionLimitOf (..)
     , SelectionResult (..)
     , SelectionSkeleton (..)
     , SelectionState (..)
@@ -44,8 +47,11 @@ import Cardano.Wallet.Primitive.CoinSelection.Balance
     , balanceMissing
     , coinSelectionLens
     , collateNonUserSpecifiedAssetQuantities
-    , fullBalance
+    , computeUTxOBalanceAvailable
+    , computeUTxOBalanceRequired
+    , computeUTxOBalanceSufficiencyInfo
     , groupByKey
+    , isUTxOBalanceSufficient
     , makeChange
     , makeChangeForCoin
     , makeChangeForNonUserSpecifiedAsset
@@ -60,11 +66,20 @@ import Cardano.Wallet.Primitive.CoinSelection.Balance
     , removeBurnValuesFromChangeMaps
     , runRoundRobin
     , runSelection
+    , runSelectionNonEmptyWith
     , runSelectionStep
+    , selectionDeltaAllAssets
+    , selectionHasValidSurplus
     , splitBundleIfAssetCountExcessive
     , splitBundlesWithExcessiveAssetCounts
     , splitBundlesWithExcessiveTokenQuantities
     , ungroupByKey
+    )
+import Cardano.Wallet.Primitive.CoinSelection.Gen
+    ( genSelectionLimit
+    , genSelectionState
+    , shrinkSelectionLimit
+    , shrinkSelectionState
     )
 import Cardano.Wallet.Primitive.Types.Address
     ( Address (..) )
@@ -85,7 +100,7 @@ import Cardano.Wallet.Primitive.Types.TokenMap.Gen
     , genAssetIdLargeRange
     , genTokenMapSmallRange
     , shrinkAssetId
-    , shrinkTokenMapSmallRange
+    , shrinkTokenMap
     )
 import Cardano.Wallet.Primitive.Types.TokenPolicy
     ( TokenName (..), TokenPolicyId (..) )
@@ -105,6 +120,8 @@ import Cardano.Wallet.Primitive.Types.Tx
     )
 import Cardano.Wallet.Primitive.Types.Tx.Gen
     ( genTxOut, shrinkTxOut )
+import Cardano.Wallet.Primitive.Types.UTxO
+    ( UTxO (..) )
 import Cardano.Wallet.Primitive.Types.UTxOIndex
     ( SelectionFilter (..), UTxOIndex )
 import Cardano.Wallet.Primitive.Types.UTxOIndex.Gen
@@ -116,11 +133,11 @@ import Data.Bifunctor
 import Data.ByteString
     ( ByteString )
 import Data.Function
-    ( on, (&) )
+    ( (&) )
 import Data.Functor.Identity
     ( Identity (..) )
 import Data.Generics.Internal.VL.Lens
-    ( view )
+    ( over, set, view )
 import Data.Generics.Labels
     ()
 import Data.List.NonEmpty
@@ -128,7 +145,7 @@ import Data.List.NonEmpty
 import Data.Map.Strict
     ( Map )
 import Data.Maybe
-    ( isJust )
+    ( fromMaybe, isJust, isNothing )
 import Data.Semigroup
     ( mtimesDefault )
 import Data.Set
@@ -166,6 +183,7 @@ import Test.QuickCheck
     , counterexample
     , cover
     , disjoin
+    , forAll
     , frequency
     , generate
     , genericShrink
@@ -185,7 +203,7 @@ import Test.QuickCheck
 import Test.QuickCheck.Classes
     ( eqLaws, ordLaws )
 import Test.QuickCheck.Monadic
-    ( assert, monadicIO, monitor, run )
+    ( PropertyM (..), assert, monadicIO, monitor, run )
 import Test.Utils.Laws
     ( testLawsMany )
 
@@ -216,6 +234,10 @@ spec = describe "Cardano.Wallet.Primitive.CoinSelection.BalanceSpec" $
     parallel $ describe "Class instances respect laws" $ do
 
         testLawsMany @(AssetCount TokenMap)
+            [ eqLaws
+            , ordLaws
+            ]
+        testLawsMany @SelectionLimit
             [ eqLaws
             , ordLaws
             ]
@@ -250,10 +272,20 @@ spec = describe "Cardano.Wallet.Primitive.CoinSelection.BalanceSpec" $
             utxoAvailable <- generate (genUTxOIndexLargeN 50000)
             pure $ property $ \minCoin costFor (Large criteria) ->
                 let
-                    criteria' = Blind $ criteria { utxoAvailable }
+                    criteria' = Blind $
+                        set #utxoAvailable utxoAvailable criteria
                 in
                     prop_performSelection minCoin costFor criteria' (const id)
                         & withMaxSuccess 5
+
+    parallel $ describe "Selection states" $ do
+
+        it "prop_genSelectionState_coverage" $
+            property prop_genSelectionState_coverage
+        it "prop_genSelectionState_valid" $
+            property prop_genSelectionState_valid
+        it "prop_shrinkSelectionState_valid" $
+            property prop_shrinkSelectionState_valid
 
     parallel $ describe "Running a selection (without making change)" $ do
 
@@ -267,6 +299,11 @@ spec = describe "Cardano.Wallet.Primitive.CoinSelection.BalanceSpec" $
             property prop_runSelection_UTxO_moreThanEnough
         it "prop_runSelection_UTxO_muchMoreThanEnough" $
             property prop_runSelection_UTxO_muchMoreThanEnough
+
+    parallel $ describe "Running a selection (non-empty)" $ do
+
+        it "prop_runSelectionNonEmpty" $
+            property prop_runSelectionNonEmpty
 
     parallel $ describe "Running a selection step" $ do
 
@@ -661,24 +698,6 @@ genSelectionCriteria genUTxOIndex' = do
             let assetsToMint = mtimesDefault (2 :: Int) assetsAvailableToMint
             pure (assetsToMint, assetsToBurn)
 
-balanceSufficient :: SelectionCriteria -> Bool
-balanceSufficient criteria =
-    balanceRequired `leq` balanceAvailable
-  where
-    SelectionCriteria
-        { outputsToCover
-        , utxoAvailable
-        , extraCoinSource
-        , assetsToMint
-        , assetsToBurn
-        } = criteria
-    balanceRequired =
-        F.foldMap (view #tokens) outputsToCover
-            <> TokenBundle.fromTokenMap assetsToBurn
-    balanceAvailable =
-        fullBalance utxoAvailable extraCoinSource
-            <> TokenBundle.fromTokenMap assetsToMint
-
 prop_performSelection_small
     :: MinCoinValueFor
     -> CostFor
@@ -688,14 +707,14 @@ prop_performSelection_small minCoinValueFor costFor (Blind (Small criteria)) =
     checkCoverage $
 
     -- Inspect the balance:
-    cover 30 (balanceSufficient criteria)
+    cover 30 (isUTxOBalanceSufficient criteria)
         "balance sufficient" $
-    cover 25 (not $ balanceSufficient criteria)
+    cover 25 (not $ isUTxOBalanceSufficient criteria)
         "balance insufficient" $
 
     -- Inspect the UTxO and user-specified outputs:
     cover 5 (utxoHasAtLeastOneAsset)
-        "UTxO has at least one assest" $
+        "UTxO has at least one asset" $
     cover 5 (not outputsHaveAtLeastOneAsset)
         "No assets to cover" $
     cover 2 (outputsHaveAtLeastOneAsset && not utxoHasAtLeastOneAsset)
@@ -742,7 +761,7 @@ prop_performSelection_small minCoinValueFor costFor (Blind (Small criteria)) =
     utxoHasAtLeastOneAsset = not
         . Set.null
         . UTxOIndex.assets
-        $ utxoAvailable criteria
+        $ view #utxoAvailable criteria
 
     outputsHaveAtLeastOneAsset =
         not . Set.null $ TokenBundle.getAssets outputTokens
@@ -758,7 +777,7 @@ prop_performSelection_small minCoinValueFor costFor (Blind (Small criteria)) =
         _ -> False
 
     selectionLimited :: Bool
-    selectionLimited = case selectionLimit criteria of
+    selectionLimited = case view #selectionLimit criteria of
         MaximumInputLimit _ -> True
         NoLimit -> False
 
@@ -818,8 +837,8 @@ prop_performSelection_large minCoinValueFor costFor (Blind (Large criteria)) =
     -- Generation of large UTxO sets takes longer, so limit the number of runs:
     withMaxSuccess 100 $
     checkCoverage $
-    cover 50 (balanceSufficient criteria)
-        "balance sufficient" $
+    cover 50 (isUTxOBalanceSufficient criteria)
+        "UTxO balance sufficient" $
     prop_performSelection minCoinValueFor costFor (Blind criteria) (const id)
 
 prop_performSelection
@@ -858,60 +877,74 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
         } = criteria
 
     onSuccess result = do
-        let totalInputValue =
-                balanceSelected
-                    <> TokenBundle.fromTokenMap assetsToMint
-        let totalOutputValue =
-                F.foldMap (view #tokens) outputsCovered
-                    <> balanceChange
-                    <> TokenBundle.fromTokenMap assetsToBurn
         monitor $ counterexample $ unlines
-            [ "available balance:"
-            , pretty (Flat balanceAvailable)
-            , "required balance:"
-            , pretty (Flat balanceRequired)
+            [ "available UTXO balance:"
+            , pretty (Flat utxoBalanceAvailable)
+            , "required UTXO balance:"
+            , pretty (Flat utxoBalanceRequired)
             , "change balance:"
             , pretty (Flat balanceChange)
-            , "cost:"
-            , pretty expectedCost
+            , "actual delta:"
+            , pretty (Flat <$> delta)
+            , "minimum expected coin surplus:"
+            , pretty minExpectedCoinSurplus
+            , "maximum expected coin surplus:"
+            , pretty maxExpectedCoinSurplus
             , "absolute minimum coin quantity:"
             , pretty absoluteMinCoinValue
-            , "actual coin delta:"
-            , pretty (TokenBundle.getCoin delta)
-            , "maximum expected delta:"
-            , pretty maximumExpectedDelta
             , "number of outputs:"
             , pretty (length outputsCovered)
             , "number of change outputs:"
             , pretty (length changeGenerated)
             ]
-        assert $ balanceSufficient criteria
-        assert $ on (==) (view #tokens)
-            totalInputValue
-            totalOutputValue
-        assert $ TokenBundle.getCoin delta >= expectedCost
-        assert $ TokenBundle.getCoin delta <= maximumExpectedDelta
-        assert $ utxoAvailable
-            == UTxOIndex.insertMany inputsSelected utxoRemaining
-        assert $ utxoRemaining
-            == UTxOIndex.deleteMany (fst <$> inputsSelected) utxoAvailable
-        assert $ outputsCovered == NE.toList outputsToCover
+        assertOnSuccess
+            "isUTxOBalanceSufficient criteria"
+            (isUTxOBalanceSufficient criteria)
+        assertOnSuccess
+            "selectionHasValidSurplus result"
+            (selectionHasValidSurplus result)
+        assertOnSuccess
+            "view #tokens surplus == TokenMap.empty"
+            (view #tokens surplus == TokenMap.empty)
+        assertOnSuccess
+            "TokenBundle.getCoin surplus >= minExpectedCoinSurplus"
+            (TokenBundle.getCoin surplus >= minExpectedCoinSurplus)
+        assertOnSuccess
+            "TokenBundle.getCoin surplus <= maxExpectedCoinSurplus"
+            (TokenBundle.getCoin surplus <= maxExpectedCoinSurplus)
+        assertOnSuccess
+            "utxoAvailable == UTxOIndex.insertMany inputsSelected utxoRemaining"
+            (utxoAvailable == UTxOIndex.insertMany inputsSelected utxoRemaining)
+        assertOnSuccess
+            "utxoRemaining == UTxOIndex.deleteMany txInsSelected utxoAvailable"
+            (utxoRemaining == UTxOIndex.deleteMany txInsSelected utxoAvailable)
+        assertOnSuccess
+            "outputsCovered == NE.toList outputsToCover"
+            (outputsCovered == NE.toList outputsToCover)
         case selectionLimit of
             MaximumInputLimit limit ->
-                assert $ NE.length inputsSelected <= limit
+                assertOnSuccess
+                    "NE.length inputsSelected <= limit"
+                    (NE.length inputsSelected <= limit)
             NoLimit ->
                 assert True
       where
+        assertOnSuccess = assertWith . (<>) "onSuccess: "
         absoluteMinCoinValue = mkMinCoinValueFor minCoinValueFor TokenMap.empty
-        delta :: TokenBundle
-        delta =
-            balanceSelected
-            `TokenBundle.unsafeSubtract`
-            (balanceRequired `TokenBundle.add` balanceChange)
-        maximumExpectedDelta =
-            expectedCost `addCoin`
-            (absoluteMinCoinValue `multiplyCoin`
-                (length outputsCovered - length changeGenerated))
+        delta :: SelectionDelta TokenBundle
+        delta = selectionDeltaAllAssets result
+        surplus :: TokenBundle
+        surplus = case delta of
+            SelectionSurplus s -> s
+            SelectionDeficit d -> error $ unwords
+                ["Unexpected deficit:", show d]
+        minExpectedCoinSurplus :: Coin
+        minExpectedCoinSurplus = mkCostFor costFor skeleton
+        maxExpectedCoinSurplus :: Coin
+        maxExpectedCoinSurplus = minExpectedCoinSurplus `addCoin` toAdd
+          where
+            toAdd = absoluteMinCoinValue `multiplyCoin`
+                (length outputsCovered - length changeGenerated)
         multiplyCoin :: Coin -> Int -> Coin
         multiplyCoin (Coin c) i = Coin $ c * fromIntegral i
         SelectionResult
@@ -928,12 +961,10 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
             , skeletonChange =
                 fmap (TokenMap.getAssets . view #tokens) changeGenerated
             }
-        balanceSelected =
-            fullBalance (UTxOIndex.fromSequence inputsSelected) extraCoinSource
+        txInsSelected :: NonEmpty TxIn
+        txInsSelected = fst <$> inputsSelected
         balanceChange =
             F.fold changeGenerated
-        expectedCost =
-            mkCostFor costFor skeleton
 
     onFailure = \case
         BalanceInsufficient e ->
@@ -946,25 +977,33 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
             onInsufficientMinCoinValues es
         UnableToConstructChange e ->
             onUnableToConstructChange e
+        EmptyUTxO ->
+            onEmptyUTxO
 
     onBalanceInsufficient e = do
-        let balanceAvailable' =
-                TokenBundle.add (balanceMissing e) balanceAvailable
         monitor $ counterexample $ unlines
             [ "available balance:"
-            , pretty (Flat balanceAvailable)
+            , pretty (Flat utxoBalanceAvailable)
             , "required balance:"
-            , pretty (Flat balanceRequired)
+            , pretty (Flat utxoBalanceRequired)
             , "missing balance:"
             , pretty (Flat $ balanceMissing e)
-            , "missing + available balance:"
-            , pretty (Flat balanceAvailable')
             ]
-        assert $ not $ balanceSufficient criteria
-        assert $ balanceAvailable == errorBalanceAvailable
-        assert $ balanceRequired  == errorBalanceRequired
-        assert (balanceRequired `leq` balanceAvailable')
+        assertOnBalanceInsufficient
+            "not $ isUTxOBalanceSufficient criteria"
+            (not $ isUTxOBalanceSufficient criteria)
+        assertOnBalanceInsufficient
+            "utxoBalanceAvailable == errorBalanceAvailable"
+            (utxoBalanceAvailable == errorBalanceAvailable)
+        assertOnBalanceInsufficient
+            "utxoBalanceRequired == errorBalanceRequired"
+            (utxoBalanceRequired == errorBalanceRequired)
+        assertOnBalanceInsufficient
+            "balanceMissing e == view #difference utxoBalanceSufficiencyInfo"
+            (balanceMissing e == view #difference utxoBalanceSufficiencyInfo)
       where
+        assertOnBalanceInsufficient =
+            assertWith . (<>) "onBalanceInsufficient: "
         BalanceInsufficientError errorBalanceAvailable errorBalanceRequired = e
 
     onSelectionInsufficient e = do
@@ -974,11 +1013,15 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
             , "selected balance:"
             , pretty (Flat errorBalanceSelected)
             ]
-        assert $ selectionLimit ==
-            MaximumInputLimit (length errorInputsSelected)
-        assert $ not (errorBalanceRequired `leq` errorBalanceSelected)
-        assert $ balanceRequired == errorBalanceRequired
+        assertOnSelectionInsufficient
+            "selectionLimit == MaximumInputLimit (length errorInputsSelected)"
+            (selectionLimit == MaximumInputLimit (length errorInputsSelected))
+        assertOnSelectionInsufficient
+            "utxoBalanceRequired == errorBalanceRequired"
+            (utxoBalanceRequired == errorBalanceRequired)
       where
+        assertOnSelectionInsufficient =
+            assertWith . (<>) "onSelectionInsufficient: "
         SelectionInsufficientError
             errorBalanceRequired errorInputsSelected = e
         errorBalanceSelected =
@@ -1013,15 +1056,21 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
                 (expectedMinCoinValue <$> es)
                 (actualMinCoinValue <$> es)
             ]
-        assert $ all (\e -> expectedMinCoinValue e > actualMinCoinValue e) es
+        assertOnInsufficientMinCoinValues
+            "all (λe -> expectedMinCoinValue e > actualMinCoinValue e) es"
+            (all (\e -> expectedMinCoinValue e > actualMinCoinValue e) es)
       where
+        assertOnInsufficientMinCoinValues =
+            assertWith . (<>) "onInsufficientMinCoinValues: "
         actualMinCoinValue
             = txOutCoin . outputWithInsufficientAda
 
     onUnableToConstructChange e = do
         monitor $ counterexample $ show e
-        assert (shortfall e > Coin 0)
-        let criteria' = criteria { selectionLimit = NoLimit }
+        assertOnUnableToConstructChange
+            "shortfall e > Coin 0"
+            (shortfall e > Coin 0)
+        let criteria' = set #selectionLimit NoLimit criteria
         let assessBundleSize =
                 mkBundleSizeAssessor NoBundleSizeLimit
         let performSelection' = performSelection
@@ -1035,71 +1084,133 @@ prop_performSelection minCoinValueFor costFor (Blind criteria) coverage =
                 assert False
             Right{} -> do
                 assert True
+      where
+        assertOnUnableToConstructChange =
+            assertWith . (<>) "onUnableToConstructChange: "
 
-    balanceRequired  =
-      F.foldMap (view #tokens) outputsToCover
-          `TokenBundle.add`
-              (TokenBundle.fromTokenMap assetsToBurn)
-          `TokenBundle.unsafeSubtract`
-              (TokenBundle.fromTokenMap assetsToMint)
-    balanceAvailable = fullBalance utxoAvailable extraCoinSource
+    onEmptyUTxO = assertWith
+        "utxoAvailable == UTxOIndex.empty"
+        (utxoAvailable == UTxOIndex.empty)
+
+    utxoBalanceAvailable = computeUTxOBalanceAvailable criteria
+    utxoBalanceRequired = computeUTxOBalanceRequired criteria
+    utxoBalanceSufficiencyInfo = computeUTxOBalanceSufficiencyInfo criteria
+
+--------------------------------------------------------------------------------
+-- Selection states
+--------------------------------------------------------------------------------
+
+prop_genSelectionState_coverage :: Property
+prop_genSelectionState_coverage =
+    forAll genSelectionState prop_genSelectionState_coverage_inner
+
+prop_genSelectionState_coverage_inner :: SelectionState -> Property
+prop_genSelectionState_coverage_inner state =
+    checkCoverage $
+    cover 0.1 (noneLeftover && noneSelected) "noneLeftover && noneSelected" $
+    cover 1.0 (haveLeftover && noneSelected) "haveLeftover && noneSelected" $
+    cover 1.0 (noneLeftover && haveSelected) "noneLeftover && haveSelected" $
+    cover 8.0 (haveLeftover && haveSelected) "haveLeftover && haveSelected" $
+    property True
+  where
+    haveLeftover = view #leftover state /= UTxOIndex.empty
+    noneLeftover = view #leftover state == UTxOIndex.empty
+    haveSelected = view #selected state /= UTxOIndex.empty
+    noneSelected = view #selected state == UTxOIndex.empty
+
+prop_genSelectionState_valid :: Property
+prop_genSelectionState_valid =
+    forAll genSelectionState isSelectionStateValid
+
+prop_shrinkSelectionState_valid :: Property
+prop_shrinkSelectionState_valid =
+    forAll genSelectionState $ \state ->
+        all isSelectionStateValid (shrinkSelectionState state)
+
+isSelectionStateValid :: SelectionState -> Bool
+isSelectionStateValid state = Set.disjoint
+    (Map.keysSet $ unUTxO $ UTxOIndex.toUTxO $ view #selected state)
+    (Map.keysSet $ unUTxO $ UTxOIndex.toUTxO $ view #leftover state)
 
 --------------------------------------------------------------------------------
 -- Running a selection (without making change)
 --------------------------------------------------------------------------------
 
-prop_runSelection_UTxO_empty
-    :: Maybe Coin
-    -> TokenBundle
-    -> Property
-prop_runSelection_UTxO_empty extraSource balanceRequested = monadicIO $ do
+prop_runSelection_UTxO_empty :: TokenBundle -> Property
+prop_runSelection_UTxO_empty balanceRequested = monadicIO $ do
     SelectionState {selected, leftover} <-
-        run $ runSelection NoLimit extraSource UTxOIndex.empty balanceRequested
+        run $ runSelection RunSelectionParams
+            { selectionLimit = NoLimit
+            , utxoAvailable = UTxOIndex.empty
+            , minimumBalance = balanceRequested
+            }
     let balanceSelected = view #balance selected
     let balanceLeftover = view #balance leftover
-    assert $ balanceSelected == TokenBundle.empty
-    assert $ balanceLeftover == TokenBundle.empty
+    assertWith
+        "balanceSelected == TokenBundle.empty"
+        (balanceSelected == TokenBundle.empty)
+    assertWith
+        "balanceLeftover == TokenBundle.empty"
+        (balanceLeftover == TokenBundle.empty)
 
 prop_runSelection_UTxO_notEnough
     :: Small UTxOIndex
     -> Property
 prop_runSelection_UTxO_notEnough (Small index) = monadicIO $ do
     SelectionState {selected, leftover} <-
-        run $ runSelection NoLimit Nothing index balanceRequested
+        run $ runSelection RunSelectionParams
+            { selectionLimit = NoLimit
+            , utxoAvailable = index
+            , minimumBalance = balanceRequested
+            }
     let balanceSelected = view #balance selected
     let balanceLeftover = view #balance leftover
-    assert $ balanceSelected == balanceAvailable
-    assert $ balanceLeftover == TokenBundle.empty
+    assertWith
+        "balanceSelected == balanceAvailable"
+        (balanceSelected == balanceAvailable)
+    assertWith
+        "balanceLeftover == TokenBundle.empty"
+        (balanceLeftover == TokenBundle.empty)
   where
     balanceAvailable = view #balance index
     balanceRequested = adjustAllQuantities (* 2) balanceAvailable
 
 prop_runSelection_UTxO_exactlyEnough
-    :: Maybe Coin
-    -> Small UTxOIndex
+    :: Small UTxOIndex
     -> Property
-prop_runSelection_UTxO_exactlyEnough extraSource (Small index) = monadicIO $ do
+prop_runSelection_UTxO_exactlyEnough (Small index) = monadicIO $ do
     SelectionState {selected, leftover} <-
-        run $ runSelection NoLimit Nothing index balanceRequested
+        run $ runSelection RunSelectionParams
+            { selectionLimit = NoLimit
+            , utxoAvailable = index
+            , minimumBalance = balanceRequested
+            }
     let balanceSelected = view #balance selected
     let balanceLeftover = view #balance leftover
-    assert $ balanceLeftover == TokenBundle.empty
+    assertWith
+        "balanceLeftover == TokenBundle.empty"
+        (balanceLeftover == TokenBundle.empty)
     if UTxOIndex.null index then
-        assert $ balanceSelected == TokenBundle.empty
+        assertWith
+            "balanceSelected == TokenBundle.empty"
+            (balanceSelected == TokenBundle.empty)
     else
-        assert $ addExtraSource extraSource balanceSelected == balanceRequested
+        assertWith
+            "balanceSelected == balanceRequested"
+            (balanceSelected == balanceRequested)
   where
-    balanceRequested = case extraSource of
-        Nothing -> view #balance index
-        Just c -> TokenBundle.add (view #balance index) (TokenBundle.fromCoin c)
+    balanceRequested = view #balance index
 
 prop_runSelection_UTxO_moreThanEnough
-    :: Maybe Coin
-    -> Small UTxOIndex
+    :: Small UTxOIndex
     -> Property
-prop_runSelection_UTxO_moreThanEnough extraSource (Small index) = monadicIO $ do
+prop_runSelection_UTxO_moreThanEnough (Small index) = monadicIO $ do
     SelectionState {selected, leftover} <-
-        run $ runSelection NoLimit extraSource index balanceRequested
+        run $ runSelection RunSelectionParams
+            { selectionLimit = NoLimit
+            , utxoAvailable = index
+            , minimumBalance = balanceRequested
+            }
     let balanceSelected = view #balance selected
     let balanceLeftover = view #balance leftover
     monitor $ cover 80
@@ -1117,8 +1228,12 @@ prop_runSelection_UTxO_moreThanEnough extraSource (Small index) = monadicIO $ do
         , "balance leftover:"
         , pretty (Flat balanceLeftover)
         ]
-    assert $ balanceRequested `leq` addExtraSource extraSource balanceSelected
-    assert $ balanceAvailable == balanceSelected <> balanceLeftover
+    assertWith
+        "balanceRequested `leq` balanceSelected"
+        (balanceRequested `leq` balanceSelected)
+    assertWith
+        "balanceAvailable == balanceSelected <> balanceLeftover"
+        (balanceAvailable == balanceSelected <> balanceLeftover)
   where
     assetsAvailable = TokenBundle.getAssets balanceAvailable
     assetsRequested = TokenBundle.getAssets balanceRequested
@@ -1127,16 +1242,19 @@ prop_runSelection_UTxO_moreThanEnough extraSource (Small index) = monadicIO $ do
         cutAssetSetSizeInHalf balanceAvailable
 
 prop_runSelection_UTxO_muchMoreThanEnough
-    :: Maybe Coin
-    -> Blind (Large UTxOIndex)
+    :: Blind (Large UTxOIndex)
     -> Property
-prop_runSelection_UTxO_muchMoreThanEnough extraSource (Blind (Large index)) =
+prop_runSelection_UTxO_muchMoreThanEnough (Blind (Large index)) =
     -- Generation of large UTxO sets takes longer, so limit the number of runs:
     withMaxSuccess 100 $
     checkCoverage $
     monadicIO $ do
         SelectionState {selected, leftover} <-
-            run $ runSelection NoLimit extraSource index balanceRequested
+            run $ runSelection RunSelectionParams
+                { selectionLimit = NoLimit
+                , utxoAvailable = index
+                , minimumBalance = balanceRequested
+                }
         let balanceSelected = view #balance selected
         let balanceLeftover = view #balance leftover
         monitor $ cover 80
@@ -1154,16 +1272,86 @@ prop_runSelection_UTxO_muchMoreThanEnough extraSource (Blind (Large index)) =
             , "balance leftover:"
             , pretty (Flat balanceLeftover)
             ]
-        assert $
-            balanceRequested `leq` addExtraSource extraSource balanceSelected
-        assert $
-            balanceAvailable == balanceSelected <> balanceLeftover
+        assertWith
+            "balanceRequested `leq` balanceSelected"
+            (balanceRequested `leq` balanceSelected)
+        assertWith
+            "balanceAvailable == balanceSelected <> balanceLeftover"
+            (balanceAvailable == balanceSelected <> balanceLeftover)
   where
     assetsAvailable = TokenBundle.getAssets balanceAvailable
     assetsRequested = TokenBundle.getAssets balanceRequested
     balanceAvailable = view #balance index
     balanceRequested = adjustAllQuantities (`div` 256) $
         cutAssetSetSizeInHalf balanceAvailable
+
+--------------------------------------------------------------------------------
+-- Running a selection (non-empty)
+--------------------------------------------------------------------------------
+
+prop_runSelectionNonEmpty :: SelectionState -> Property
+prop_runSelectionNonEmpty result = conjoin
+    [ prop_genSelectionState_coverage_inner result
+    , prop_runSelectionNonEmpty_inner result
+    ]
+
+prop_runSelectionNonEmpty_inner :: SelectionState -> Property
+prop_runSelectionNonEmpty_inner result =
+    case (haveLeftover, haveSelected) of
+        (False, False) ->
+            -- In this case, the available UTxO set was completely empty.
+            -- Since there's nothing to select, we must fail with 'Nothing':
+            property $ isNothing maybeResultNonEmpty
+        (False, True) ->
+            -- In this case, we've already selected all entries from the
+            -- available UTxO, so there's no more work to do. We need to check
+            -- that 'runSelectionNonEmpty' does not expand the selection:
+            maybeResultNonEmpty === Just result
+        (True, True) ->
+            -- In this case, we've already selected some entries from the
+            -- available UTxO, so there's no more work to do. We need to check
+            -- that 'runSelectionNonEmpty' does not expand the selection:
+            maybeResultNonEmpty === Just result
+        (True, False) ->
+            -- This represents the case where 'runSelection' does not select
+            -- anything at all, even though we do have at least one UTxO entry
+            -- available. This is the only case where 'runSelectionNonEmpty' is
+            -- expected to perform extra work: it should select precisely one
+            -- entry, and no more:
+            checkResultNonEmpty
+  where
+    haveLeftover = view #leftover result /= UTxOIndex.empty
+    haveSelected = view #selected result /= UTxOIndex.empty
+
+    checkResultNonEmpty :: Property
+    checkResultNonEmpty = checkSelectedElement &
+        fromMaybe (error "Failed to select an entry when one was available")
+      where
+        checkSelectedElement :: Maybe Property
+        checkSelectedElement = do
+            resultNonEmpty <- maybeResultNonEmpty
+            (i, o) <- matchSingletonList $
+                UTxOIndex.toList $ view #selected resultNonEmpty
+            pure $
+                UTxOIndex.insert i o (view #leftover resultNonEmpty)
+                === view #leftover result
+
+    maybeResultNonEmpty :: Maybe SelectionState
+    maybeResultNonEmpty = runIdentity $ runSelectionNonEmptyWith
+        (Identity <$> mockSelectSingleEntry)
+        (result)
+
+mockSelectSingleEntry :: SelectionState -> Maybe SelectionState
+mockSelectSingleEntry state =
+    selectEntry <$> firstLeftoverEntry state
+  where
+    firstLeftoverEntry :: SelectionState -> Maybe (TxIn, TxOut)
+    firstLeftoverEntry = Map.lookupMin . unUTxO . UTxOIndex.toUTxO . leftover
+
+    selectEntry :: (TxIn, TxOut) -> SelectionState
+    selectEntry (i, o) = state
+        & over #selected (UTxOIndex.insert i o)
+        & over #leftover (UTxOIndex.delete i)
 
 --------------------------------------------------------------------------------
 -- Running a selection step
@@ -1296,8 +1484,12 @@ prop_assetSelectionLens_givesPriorityToSingletonAssets (Blind (Small u)) =
                 let output = head $ snd <$> UTxOIndex.toList selected
                 let bundle = view #tokens output
                 case F.toList $ TokenBundle.getAssets bundle of
-                    [a] -> assert $ a == asset
-                    _   -> assert $ not hasSingletonAsset
+                    [a] -> assertWith
+                        "a == asset"
+                        (a == asset)
+                    _ -> assertWith
+                        "not hasSingletonAsset"
+                        (not hasSingletonAsset)
   where
     asset = Set.findMin $ UTxOIndex.assets u
     assetCount = Set.size $ UTxOIndex.assets u
@@ -1328,12 +1520,12 @@ prop_coinSelectionLens_givesPriorityToCoins (Blind (Small u)) =
                 let output = head $ snd <$> UTxOIndex.toList selected
                 let bundle = view #tokens output
                 case F.toList $ TokenBundle.getAssets bundle of
-                    [] -> assert hasCoin
-                    _  -> assert $ not hasCoin
+                    [] -> assertWith     "hasCoin" (    hasCoin)
+                    _  -> assertWith "not hasCoin" (not hasCoin)
   where
     entryCount = UTxOIndex.size u
     initialState = SelectionState UTxOIndex.empty u
-    lens = coinSelectionLens NoLimit Nothing minimumCoinQuantity
+    lens = coinSelectionLens NoLimit minimumCoinQuantity
     minimumCoinQuantity = Coin 1
 
 --------------------------------------------------------------------------------
@@ -1552,7 +1744,7 @@ boundaryTest_largeTokenQuantities_4 = BoundaryTestData
 -- the change generation algorithm terminates after only a subset of the UTxO
 -- has been selected.
 --
--- See: https://jira.iohk.io/browse/ADP-890
+-- See: https://input-output.atlassian.net/browse/ADP-890
 --
 boundaryTest_largeTokenQuantities_5 :: BoundaryTestData
 boundaryTest_largeTokenQuantities_5 = BoundaryTestData
@@ -1590,7 +1782,7 @@ boundaryTest_largeTokenQuantities_5 = BoundaryTestData
 -- the change generation algorithm terminates after only a subset of the UTxO
 -- has been selected.
 --
--- See: https://jira.iohk.io/browse/ADP-890
+-- See: https://input-output.atlassian.net/browse/ADP-890
 --
 boundaryTest_largeTokenQuantities_6 :: BoundaryTestData
 boundaryTest_largeTokenQuantities_6 = BoundaryTestData
@@ -3415,6 +3607,11 @@ prop_reduceTokenQuantities_order reduceQty qtyDiffs =
 -- Utility functions
 --------------------------------------------------------------------------------
 
+assertWith :: Monad m => String -> Bool -> PropertyM m ()
+assertWith description condition = do
+    monitor $ counterexample ("Assertion failed: " <> description)
+    assert condition
+
 adjustAllQuantities :: (Natural -> Natural) -> TokenBundle -> TokenBundle
 adjustAllQuantities f b = uncurry TokenBundle.fromFlatList $ bimap
     (adjustCoin)
@@ -3442,10 +3639,10 @@ consecutivePairs xs = case tailMay xs of
     Nothing -> []
     Just ys -> xs `zip` ys
 
-addExtraSource :: Maybe Coin -> TokenBundle -> TokenBundle
-addExtraSource extraSource =
-    TokenBundle.add
-        (maybe TokenBundle.empty TokenBundle.fromCoin extraSource)
+matchSingletonList :: [a] -> Maybe a
+matchSingletonList = \case
+    [a] -> Just a
+    _   -> Nothing
 
 mockAsset :: ByteString -> AssetId
 mockAsset a = AssetId (UnsafeTokenPolicyId $ Hash a) (UnsafeTokenName "1")
@@ -3504,9 +3701,17 @@ genTokenMapLarge = do
         <$> genAssetIdLargeRange
         <*> genTokenQuantityPositive
 
+instance Arbitrary SelectionLimit where
+    arbitrary = genSelectionLimit
+    shrink = shrinkSelectionLimit
+
+instance Arbitrary SelectionState where
+    arbitrary = genSelectionState
+    shrink = shrinkSelectionState
+
 instance Arbitrary TokenMap where
     arbitrary = genTokenMapSmallRange
-    shrink = shrinkTokenMapSmallRange
+    shrink = shrinkTokenMap
 
 instance Arbitrary TokenQuantity where
     arbitrary = genTokenQuantityPositive

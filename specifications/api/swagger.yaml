@@ -1,7 +1,7 @@
 openapi: 3.0.0
 info:
   title: Cardano Wallet Backend API
-  version: v2021-06-11
+  version: v2021-09-09
   license:
     name: Apache-2.0
     url: https://raw.githubusercontent.com/input-output-hk/cardano-wallet/master/LICENSE
@@ -1674,6 +1674,54 @@ x-maximumTokenBundleSize: &maximumTokenBundleSize
       enum:
         - byte
 
+x-txScriptValidity: &txScriptValidity
+  description: |
+    Indicates whether the phase-2 monetary policy script (e.g. Plutus script)
+    used in the transaction validated or not. Validity may be null if this
+    transaction was from an era that doesn't support phase-2 monetary policy
+    scripts, or is a pending transaction (we don't know if validation passed or
+    failed until the transaction hits the ledger).
+  nullable: true
+  type: string
+  enum:
+    - valid
+    - invalid
+
+x-rationalAsPair: &rationalAsPair
+  type: object
+  required:
+    - denominator
+    - numerator
+  properties:
+    denominator:
+      type: integer
+      minimum: 0
+    numerator:
+      type: integer
+      minimum: 0
+
+x-rationalAsNumber: &rationalAsNumber
+  type: integer
+  minimum: 0
+
+x-rational: &rational
+  nullable: false
+  oneOf:
+    - <<: *rationalAsNumber
+      title: rational as number
+    - <<: *rationalAsPair
+      title: rational as denominator and numerator
+
+x-executionUnitPrices: &executionUnitPrices
+  type: object
+  description: |
+    The price of time unit and memory unit used for calculating a fee of a script execution.
+  required:
+    - step_price
+    - memory_unit_price
+  properties:
+    step_price: *rational
+    memory_unit_price: *rational
 
 #############################################################################
 #                                                                           #
@@ -1862,6 +1910,8 @@ components:
             The maximum number of collateral inputs that can be used in a single transaction.
         maximum_token_bundle_size:
           <<: *maximumTokenBundleSize
+        execution_unit_prices:
+          <<: *executionUnitPrices
 
     ApiSelectCoinsPayments: &ApiSelectCoinsPayments
       type: object
@@ -2024,7 +2074,7 @@ components:
     ApiAccountKey: &ApiAccountKey
       type: string
       format: bech32
-      pattern: "^((acct_xvk)|(acct_vk))1[0-9a-z]*$"
+      pattern: "^((acct_xvk)|(acct_vk)|(acct_shared_xvk)|(acct_shared_vk))1[0-9a-z]*$"
 
     ApiAccountKeyShared: &ApiAccountKeyShared
       type: string
@@ -2037,14 +2087,6 @@ components:
         - id
       properties:
         id: *transactionId
-
-    ApiSerialisedTransaction: &ApiSerialisedTransaction
-      description: |
-        An encoded transaction.
-      required:
-        - transaction
-      properties:
-        transaction: *serialisedTransaction
 
     ApiConstructTransaction: &ApiConstructTransaction
       type: object
@@ -2097,6 +2139,7 @@ components:
         mint: *transactionMint
         status: *transactionStatus
         metadata: *transactionMetadata
+        script_validity: *txScriptValidity
 
     x-txBody: &txBody
       oneOf:
@@ -2745,6 +2788,10 @@ components:
           <<: *lenientPassphrase
           description: The wallet's master passphrase.
         transaction: *serialisedTransaction
+        withdrawal:
+          oneOf:
+            - <<: *transactionWithdrawalRequestSelf
+            - <<: *transactionRedemptionRequest
 
     # ADP-908 Deprecated
     ApiPostTransactionDataByron: &ApiPostTransactionDataByron
@@ -4924,7 +4971,7 @@ paths:
       tags: ["Assets"]
       summary: Get Asset (empty name)
       description: |
-        Fetch the the asset from `policy_id` with an empty name.
+        Fetch the asset from `policy_id` with an empty name.
 
         The asset must be associated with the wallet.
       parameters:
@@ -5153,12 +5200,16 @@ paths:
       description: |
         <p align="right">status: <strong>under development</strong></p>
 
-        Sign a transaction body and return the full transaction. That
-        is, create witnesses using the keys available to this wallet
-        and attach them to the body.
+        Signs a serialised transaction, returning the modified
+        transaction.
 
-        If a full transaction is passed in the request, then new
-        witnesses will be added to the existing witness set.
+        This endpoint will add new witnesses using the keys available
+        to this wallet. Any existing witnesses will remain in the
+        witness set.
+
+        If the source transaction includes a reward account withdrawal
+        from another wallet, then the `withdrawal` field must be set
+        accordingly in this request.
       parameters:
         - *parametersWalletId
       requestBody:
@@ -5520,7 +5571,7 @@ paths:
       tags: ["Byron Assets"]
       summary: Get Asset (empty name)
       description: |
-        Fetch the the asset from `policy_id` with an empty name.
+        Fetch the asset from `policy_id` with an empty name.
 
         The asset must be associated with the wallet.
       parameters:
@@ -5720,12 +5771,12 @@ paths:
       description: |
         <p align="right">status: <strong>under development</strong></p>
 
-        Sign a transaction body and return the full transaction. That
-        is, create witnesses using the keys available to this wallet
-        and attach them to the body.
+        Signs a serialised transaction, returning the modified
+        transaction.
 
-        If a full transaction is passed in the request, then new
-        witnesses will be added to the existing witness set.
+        This endpoint will add new witnesses using the keys available
+        to this wallet. Any existing witnesses will remain in the
+        witness set.
       parameters:
         - *parametersWalletId
       requestBody:

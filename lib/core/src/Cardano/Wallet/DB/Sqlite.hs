@@ -159,6 +159,8 @@ import Cardano.Wallet.Primitive.Types.TokenBundle
     ( TokenBundle )
 import Cardano.Wallet.Primitive.Types.TokenMap
     ( AssetId (..) )
+import Cardano.Wallet.Util
+    ( invariant )
 import Control.Monad
     ( forM, forM_, unless, void, when, (<=<) )
 import Control.Monad.Extra
@@ -1819,7 +1821,8 @@ mkTxHistory
         , [TxWithdrawal]
         )
 mkTxHistory wid txs = flatTxHistory
-    [ ( mkTxMetaEntity wid txid (W.fee tx) (W.metadata tx) derived
+    [ ( mkTxMetaEntity
+          wid txid (W.fee tx) (W.metadata tx) derived (W.scriptValidity tx)
       , mkTxInputsOutputs (txid, tx)
       , mkTxWithdrawals (txid, tx)
       )
@@ -1922,8 +1925,9 @@ mkTxMetaEntity
     -> Maybe W.Coin
     -> Maybe W.TxMetadata
     -> W.TxMeta
+    -> Maybe W.TxScriptValidity
     -> TxMeta
-mkTxMetaEntity wid txid mfee meta derived = TxMeta
+mkTxMetaEntity wid txid mfee meta derived scriptValidity = TxMeta
     { txMetaTxId = TxId txid
     , txMetaWalletId = wid
     , txMetaStatus = derived ^. #status
@@ -1934,6 +1938,9 @@ mkTxMetaEntity wid txid mfee meta derived = TxMeta
     , txMetaFee = fromIntegral . W.unCoin <$> mfee
     , txMetaSlotExpires = derived ^. #expiry
     , txMetadata = meta
+    , txMetaScriptValidity = scriptValidity <&> \case
+          W.TxScriptValid -> True
+          W.TxScriptInvalid -> False
     }
 
 -- note: TxIn records must already be sorted by order
@@ -1952,8 +1959,13 @@ txHistoryFromEntity ti tip metas ins cins outs ws =
     mapM mkItem metas
   where
     startTime' = interpretQuery ti . slotToUTCTime
-    mkItem m = mkTxWith (txMetaTxId m) (txMetaFee m) (txMetadata m) (mkTxDerived m)
-    mkTxWith txid mfee meta derived = do
+    mkItem m = mkTxWith
+        (txMetaTxId m)
+        (txMetaFee m)
+        (txMetadata m)
+        (mkTxDerived m)
+        (txMetaScriptValidity m)
+    mkTxWith txid mfee meta derived isValid = do
         t <- startTime' (derived ^. #slotNo)
         return $ W.TransactionInfo
             { W.txInfoId =
@@ -1979,6 +1991,9 @@ txHistoryFromEntity ti tip metas ins cins outs ws =
                 Quantity $ fromIntegral $ if tipH > txH then tipH - txH else 0
             , W.txInfoTime =
                 t
+            , W.txInfoScriptValidity = isValid <&> \case
+                  False -> W.TxScriptInvalid
+                  True -> W.TxScriptValid
             }
       where
         txH  = getQuantity (derived ^. #blockHeight)
@@ -2509,7 +2524,7 @@ instance
                 (Seq.internalPool st, Seq.externalPool st)
         let (Seq.ParentContextUtxo accXPubInternal) = Seq.context intPool
         let (Seq.ParentContextUtxo accXPubExternal) = Seq.context extPool
-        let (accountXPub, _) = W.invariant
+        let (accountXPub, _) = invariant
                 "Internal & External pool use different account public keys!"
                 ( accXPubExternal, accXPubInternal )
                 (uncurry (==))

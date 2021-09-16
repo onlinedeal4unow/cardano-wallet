@@ -63,12 +63,18 @@ import Cardano.Wallet.Primitive.Types.Address
     ( Address (..) )
 import Cardano.Wallet.Primitive.Types.RewardAccount
     ( RewardAccount (..) )
+import Control.Exception.Safe
+    ( try )
 import Control.Monad
-    ( forM_ )
+    ( forM, forM_ )
+import Control.Monad.IO.Class
+    ( liftIO )
 import Data.Aeson.QQ
     ( aesonQQ )
 import Data.Bifunctor
     ( first )
+import Data.Either
+    ( partitionEithers )
 import Data.Function
     ( (&) )
 import Data.IORef
@@ -123,13 +129,15 @@ import Network.Wai.Test
 import Servant
     ( Accept (..), Application, ReqBody, Server, StdMethod (..), Verb, serve )
 import Servant.API
-    ( (:<|>) (..), (:>), Capture )
+    ( (:<|>) (..), (:>), Capture, OctetStream )
 import Servant.API.Verbs
     ( NoContentVerb, ReflectMethod (..) )
 import Test.Hspec
     ( HasCallStack, Spec, describe, it, runIO, xdescribe )
 import Test.Hspec.Extra
     ( parallel )
+import Test.HUnit.Lang
+    ( HUnitFailure (..), formatFailureReason )
 import Type.Reflection
     ( typeOf )
 
@@ -139,19 +147,19 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Servant
-
+import qualified Test.HUnit as HUnit
 
 spec :: Spec
 spec = parallel $ do
     gSpec (everyPathParam api) $ \(SomeTest proxy tests) ->
         parallel $ describe "Malformed PathParam" $ do
             forM_ tests $ \(req, msg) -> it (titleize proxy req) $
-                runSession (spec_MalformedParam req msg) application
+                runSession (spec_MalformedParam [req] msg) application
 
     gSpec (everyBodyParam api) $ \(SomeTest proxy tests) ->
         parallel $ describe "Malformed BodyParam" $ do
             forM_ tests $ \(req, msg) -> it (titleize proxy req) $
-                runSession (spec_MalformedParam req msg) application
+                runSession (spec_MalformedParam [req] msg) application
 
     gSpec (everyHeader api) $ \(SomeTest proxy tests) -> do
         case typeOf proxy `testEquality` typeOf (Proxy @"Accept") of
@@ -188,10 +196,30 @@ assertErrorResponse status code (ExpectedError msg) response = do
         , "message": #{msg}
         }|])
 
-spec_MalformedParam :: Request -> ExpectedError -> Session ()
-spec_MalformedParam malformedRequest expectedError = do
-    response <- request malformedRequest
-    assertErrorResponse 400 "bad_request" expectedError response
+-- Under the hood, the failures we get back from using "assertErrorResponse" are
+-- of type "HUnitFailure". Provide a function to print these failures.
+formatHUnitFailure :: HUnitFailure -> String
+formatHUnitFailure (HUnitFailure _ reason) = formatFailureReason reason
+
+spec_MalformedParam :: [Request] -> ExpectedError -> Session ()
+spec_MalformedParam malformedRequests expectedError = do
+    (errs :: [Either HUnitFailure ()]) <- forM malformedRequests $ \malformedRequest -> do
+      response <- request malformedRequest
+      try $ assertErrorResponse 400 "bad_request" expectedError response
+    case partitionEithers errs of
+        -- Every assertion failed
+        ([failure], [])   ->
+            -- We used to only handle singular requests, so provide this case to
+            -- format error messages how they used to be formatted when there is
+            -- only a single request failure.
+            liftIO $ HUnit.assertFailure (formatHUnitFailure failure)
+        (failures, [])   ->
+            liftIO $ HUnit.assertFailure $ unlines $
+                [ "No request returned the expected response, here is a list of errors:"
+                ] <> fmap (("- " <>) . formatHUnitFailure) failures
+        -- At least one assertion succeeded
+        (_, _x:_xs) ->
+            pure ()
 
 spec_WrongAcceptHeader :: Request -> ExpectedError -> Session ()
 spec_WrongAcceptHeader malformedRequest expectedError = do
@@ -553,6 +581,48 @@ instance
         gEveryHeader (Proxy @sub) (addPathFragment t req)
       where
         t = PathParam $ T.pack $ symbolVal (Proxy @s)
+
+-- We can provide a more specific instance than "ReqBody [ct]" to override the
+-- general behaviour with more specific OctetStream behaviour.
+--
+-- From the GHC user guide:
+--
+-- GHC requires that it be unambiguous which instance declaration should be used
+-- to resolve a type-class constraint. GHC also provides a way to loosen the
+-- instance resolution, by allowing more than one instance to match, provided
+-- there is a most specific one.
+--
+-- - Eliminate any candidate IX for which there is another candidate IY such
+--   that both of the following hold:
+--   - IY is strictly more specific than IX. That is, IY is a substitution
+--     instance of IX but not vice versa.
+--   - Either IX is overlappable, or IY is overlapping. (This “either/or”
+--     design, rather than a “both/and” design, allow a client to deliberately
+--     override an instance from a library, without requiring a change to the
+--     library.)
+instance {-# OVERLAPPING #-}
+    ( GEveryEndpoints sub
+    ) => GEveryEndpoints (ReqBody '[OctetStream] a :> sub)
+  where
+    gEveryEndpoint _ =
+        gEveryEndpoint (Proxy @sub)
+
+    type MkPathRequest (ReqBody '[OctetStream] a :> sub) = MkPathRequest sub
+    gEveryPathParam _ =
+        gEveryPathParam (Proxy @sub)
+
+    type MkBodyRequest (ReqBody '[OctetStream] a :> sub) = BodyParam a -> IO (MkBodyRequest sub)
+    gEveryBodyParam _ req b =
+        gEveryBodyParam (Proxy @sub) <$> (setRequestBody b req {
+            requestHeaders = [ (hContentType, "application/octet-stream")
+                             , (hAccept, "*/*")
+                             ]
+        })
+
+    type MkHeaderRequest (ReqBody '[OctetStream] a :> sub) = Header "Content-Type" OctetStream -> MkHeaderRequest sub
+    gEveryHeader _ req (Header h) =
+        gEveryHeader (Proxy @sub) $ req
+            { requestHeaders = requestHeaders req ++ [(hContentType, h)] }
 
 instance
     ( GEveryEndpoints sub

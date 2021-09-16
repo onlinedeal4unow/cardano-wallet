@@ -1,5 +1,5 @@
 name:                cardano-wallet-core
-version:             2021.8.27
+version:             2021.9.9
 synopsis:            The Wallet Backend for a Cardano node.
 description:         Please see README.md
 homepage:            https://github.com/input-output-hk/cardano-wallet
@@ -39,6 +39,7 @@ library
     , bytestring
     , cardano-addresses
     , cardano-api
+    , cardano-binary
     , cardano-crypto
     , cardano-numeric
     , cardano-ledger-core
@@ -62,6 +63,7 @@ library
     , fmt
     , foldl
     , generic-lens
+    , generic-arbitrary
     , hashable
     , http-api-data
     , http-client
@@ -208,6 +210,7 @@ library
       Cardano.Wallet.TokenMetadata.MockServer
       Cardano.Wallet.Transaction
       Cardano.Wallet.Unsafe
+      Cardano.Wallet.Util
       Cardano.Wallet.Version
       Cardano.Wallet.Version.TH
       Control.Concurrent.Concierge
@@ -230,6 +233,7 @@ library
         -- The following modules define QC generators and shrinkers that can
         -- be used by both `cardano-wallet-core` and `cardano-wallet`:
         --
+      Cardano.Wallet.Primitive.CoinSelection.Gen
       Cardano.Wallet.Primitive.Types.Address.Gen
       Cardano.Wallet.Primitive.Types.Coin.Gen
       Cardano.Wallet.Primitive.Types.RewardAccount.Gen
@@ -268,6 +272,7 @@ test-suite unit
     , cardano-api
     , cardano-binary
     , cardano-crypto
+    , cardano-crypto-class
     , cardano-numeric
     , cardano-ledger-byron
     , cardano-ledger-byron-test
@@ -300,6 +305,7 @@ test-suite unit
     , http-client-tls
     , http-media
     , http-types
+    , HUnit
     , iohk-monitoring
     , io-classes
     , io-sim
@@ -322,6 +328,7 @@ test-suite unit
     , random
     , retry
     , safe
+    , safe-exceptions
     , scrypt
     , servant
     , servant-server
@@ -405,6 +412,7 @@ test-suite unit
       Cardano.Wallet.Primitive.Types.TokenMapSpec.TypeErrorSpec
       Cardano.Wallet.Primitive.Types.TokenPolicySpec
       Cardano.Wallet.Primitive.Types.TokenQuantitySpec
+      Cardano.Wallet.Primitive.Types.TxSpec
       Cardano.Wallet.Primitive.Types.UTxOSpec
       Cardano.Wallet.Primitive.Types.UTxOIndexSpec
       Cardano.Wallet.Primitive.Types.UTxOIndex.TypeErrorSpec

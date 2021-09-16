@@ -11,7 +11,7 @@
     flags = { release = false; };
     package = {
       specVersion = "1.10";
-      identifier = { name = "cardano-wallet-core"; version = "2021.8.27"; };
+      identifier = { name = "cardano-wallet-core"; version = "2021.9.9"; };
       license = "Apache-2.0";
       copyright = "2018-2020 IOHK";
       maintainer = "operations@iohk.io";
@@ -35,6 +35,7 @@
           (hsPkgs."bytestring" or (errorHandler.buildDepError "bytestring"))
           (hsPkgs."cardano-addresses" or (errorHandler.buildDepError "cardano-addresses"))
           (hsPkgs."cardano-api" or (errorHandler.buildDepError "cardano-api"))
+          (hsPkgs."cardano-binary" or (errorHandler.buildDepError "cardano-binary"))
           (hsPkgs."cardano-crypto" or (errorHandler.buildDepError "cardano-crypto"))
           (hsPkgs."cardano-numeric" or (errorHandler.buildDepError "cardano-numeric"))
           (hsPkgs."cardano-ledger-core" or (errorHandler.buildDepError "cardano-ledger-core"))
@@ -58,6 +59,7 @@
           (hsPkgs."fmt" or (errorHandler.buildDepError "fmt"))
           (hsPkgs."foldl" or (errorHandler.buildDepError "foldl"))
           (hsPkgs."generic-lens" or (errorHandler.buildDepError "generic-lens"))
+          (hsPkgs."generic-arbitrary" or (errorHandler.buildDepError "generic-arbitrary"))
           (hsPkgs."hashable" or (errorHandler.buildDepError "hashable"))
           (hsPkgs."http-api-data" or (errorHandler.buildDepError "http-api-data"))
           (hsPkgs."http-client" or (errorHandler.buildDepError "http-client"))
@@ -139,6 +141,7 @@
             (hsPkgs."cardano-api" or (errorHandler.buildDepError "cardano-api"))
             (hsPkgs."cardano-binary" or (errorHandler.buildDepError "cardano-binary"))
             (hsPkgs."cardano-crypto" or (errorHandler.buildDepError "cardano-crypto"))
+            (hsPkgs."cardano-crypto-class" or (errorHandler.buildDepError "cardano-crypto-class"))
             (hsPkgs."cardano-numeric" or (errorHandler.buildDepError "cardano-numeric"))
             (hsPkgs."cardano-ledger-byron" or (errorHandler.buildDepError "cardano-ledger-byron"))
             (hsPkgs."cardano-ledger-byron-test" or (errorHandler.buildDepError "cardano-ledger-byron-test"))
@@ -171,6 +174,7 @@
             (hsPkgs."http-client-tls" or (errorHandler.buildDepError "http-client-tls"))
             (hsPkgs."http-media" or (errorHandler.buildDepError "http-media"))
             (hsPkgs."http-types" or (errorHandler.buildDepError "http-types"))
+            (hsPkgs."HUnit" or (errorHandler.buildDepError "HUnit"))
             (hsPkgs."iohk-monitoring" or (errorHandler.buildDepError "iohk-monitoring"))
             (hsPkgs."io-classes" or (errorHandler.buildDepError "io-classes"))
             (hsPkgs."io-sim" or (errorHandler.buildDepError "io-sim"))
@@ -193,6 +197,7 @@
             (hsPkgs."random" or (errorHandler.buildDepError "random"))
             (hsPkgs."retry" or (errorHandler.buildDepError "retry"))
             (hsPkgs."safe" or (errorHandler.buildDepError "safe"))
+            (hsPkgs."safe-exceptions" or (errorHandler.buildDepError "safe-exceptions"))
             (hsPkgs."scrypt" or (errorHandler.buildDepError "scrypt"))
             (hsPkgs."servant" or (errorHandler.buildDepError "servant"))
             (hsPkgs."servant-server" or (errorHandler.buildDepError "servant-server"))

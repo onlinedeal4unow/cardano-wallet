@@ -86,13 +86,13 @@ import Cardano.Wallet.Primitive.Types
     , DelegationCertificate (..)
     , EpochNo (..)
     , EraInfo (..)
+    , ExecutionUnitPrices (..)
     , FeePolicy (..)
     , MinimumUTxOValue (..)
     , PassphraseScheme (..)
     , PoolId (..)
     , ProtocolParameters (..)
     , Range (..)
-    , ShowFmt (..)
     , SlotInEpoch (..)
     , SlotNo (..)
     , SortOrder (..)
@@ -126,13 +126,18 @@ import Cardano.Wallet.Primitive.Types.Tx
     , TxMeta (..)
     , TxMetadata
     , TxOut (..)
+    , TxScriptValidity (..)
     , TxStatus (..)
     , isPending
     )
+import Cardano.Wallet.Primitive.Types.Tx.Gen
+    ( genTxScriptValidity, shrinkTxScriptValidity )
 import Cardano.Wallet.Primitive.Types.UTxO
     ( UTxO (..) )
 import Cardano.Wallet.Unsafe
     ( someDummyMnemonic, unsafeMkPercentage )
+import Cardano.Wallet.Util
+    ( ShowFmt (..) )
 import Control.Arrow
     ( second )
 import Control.DeepSeq
@@ -183,6 +188,7 @@ import Test.QuickCheck
     , frequency
     , generate
     , genericShrink
+    , liftArbitrary
     , oneof
     , scale
     , shrinkIntegral
@@ -376,10 +382,10 @@ arbitraryChainLength = 10
 -------------------------------------------------------------------------------}
 
 instance Arbitrary Tx where
-    shrink (Tx _tid fees ins cins outs wdrls md) =
-        [ mkTx fees ins' cins' outs' wdrls' md'
-        | (ins', cins', outs', wdrls', md') <-
-            shrink (ins, cins, outs, wdrls, md)
+    shrink (Tx _tid fees ins cins outs wdrls md validity) =
+        [ mkTx fees ins' cins' outs' wdrls' md' validity'
+        | (ins', cins', outs', wdrls', md', validity') <-
+            shrink (ins, cins, outs, wdrls, md, validity)
         ]
 
     arbitrary = do
@@ -388,7 +394,8 @@ instance Arbitrary Tx where
         outs <- fmap (L.take 5 . getNonEmpty) arbitrary
         wdrls <- fmap (Map.fromList . L.take 5) arbitrary
         fees <- arbitrary
-        mkTx fees ins cins outs wdrls <$> arbitrary
+        mkTx fees ins cins outs wdrls
+            <$> arbitrary <*> liftArbitrary genTxScriptValidity
 
 instance Arbitrary TxIn where
     arbitrary = TxIn
@@ -640,6 +647,11 @@ instance Arbitrary ProtocolParameters where
         <*> arbitrary
         <*> arbitrary
         <*> arbitrary
+        <*> arbitrary
+
+instance Arbitrary ExecutionUnitPrices where
+    shrink = genericShrink
+    arbitrary = genericArbitrary
 
 instance Arbitrary MinimumUTxOValue where
     shrink = genericShrink
@@ -716,6 +728,10 @@ instance Arbitrary AddressState where
 
 instance Arbitrary SomeMnemonic where
     arbitrary = SomeMnemonic <$> genMnemonic @12
+
+instance Arbitrary TxScriptValidity where
+    arbitrary = genTxScriptValidity
+    shrink = shrinkTxScriptValidity
 
 {-------------------------------------------------------------------------------
                                    Buildable

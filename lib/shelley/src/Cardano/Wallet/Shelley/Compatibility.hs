@@ -9,6 +9,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -17,6 +18,7 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 -- Orphan instances for {Encode,Decode}Address until we get rid of the
 -- Jörmungandr dual support.
@@ -29,22 +31,29 @@
 -- Conversion functions and static chain settings for Shelley.
 
 module Cardano.Wallet.Shelley.Compatibility
-    ( AnyCardanoEra(..)
-    , CardanoEra(..)
-    , ShelleyEra
-    , AllegraEra
-    , CardanoBlock
-    , NetworkId
-
-    , NodeToClientVersionData
+    ( CardanoBlock
     , StandardCrypto
     , StandardShelley
 
       -- * Protocol Parameters
+    , NetworkId (..)
+    , NodeToClientVersionData
     , nodeToClientVersions
+
+      -- * Node Connection
+    , localNodeConnectInfo
 
       -- * Genesis
     , emptyGenesis
+
+      -- * Eras
+    , AnyCardanoEra (..)
+    , AnyShelleyBasedEra (..)
+    , CardanoEra (..)
+    , ShelleyBasedEra (..)
+    , shelleyBasedToCardanoEra
+    , shelleyToCardanoEra
+    , getShelleyBasedEra
 
       -- * Conversions
     , toCardanoHash
@@ -57,7 +66,6 @@ module Cardano.Wallet.Shelley.Compatibility
     , toMaryTxOut
     , toAlonzoTxOut
     , toCardanoLovelace
-    , sealShelleyTx
     , toStakeKeyRegCert
     , toStakeKeyDeregCert
     , toStakePoolDlgCert
@@ -72,9 +80,7 @@ module Cardano.Wallet.Shelley.Compatibility
     , rewardAccountFromAddress
     , fromShelleyPParams
     , fromAlonzoPParams
-    , unsafeIntToWord
-    , internalError
-    , isInternalError
+    , fromLedgerExUnits
 
       -- ** Assessing sizes of token bundles
     , tokenBundleSizeAssessor
@@ -100,6 +106,7 @@ module Cardano.Wallet.Shelley.Compatibility
     , fromGenesisData
     , fromTip
     , fromTip'
+    , fromCardanoTx
     , fromShelleyTx
     , fromAllegraTx
     , fromShelleyBlock
@@ -132,17 +139,31 @@ import Cardano.Api
     , AnyCardanoEra (..)
     , AsType (..)
     , CardanoEra (..)
+    , CardanoEraStyle (..)
+    , CardanoMode
+    , ConsensusModeParams (CardanoModeParams)
+    , EraInMode (..)
+    , InAnyCardanoEra (..)
+    , IsCardanoEra (..)
+    , LocalNodeConnectInfo (LocalNodeConnectInfo)
     , MaryEra
     , NetworkId
     , ShelleyEra
+    , TxInMode (..)
+    , cardanoEraStyle
     , deserialiseFromRawBytes
     )
 import Cardano.Api.Shelley
-    ( ShelleyGenesis (..), fromShelleyMetadata )
-import Cardano.Binary
-    ( fromCBOR, serialize' )
+    ( InAnyShelleyBasedEra (..)
+    , IsShelleyBasedEra (..)
+    , ShelleyBasedEra (..)
+    , ShelleyGenesis (..)
+    , fromShelleyMetadata
+    )
 import Cardano.Crypto.Hash.Class
     ( Hash (UnsafeHash), hashToBytes )
+import Cardano.Launcher.Node
+    ( CardanoNodeConn, nodeSocketFile )
 import Cardano.Ledger.BaseTypes
     ( strictMaybeToMaybe, urlToText )
 import Cardano.Ledger.Era
@@ -170,15 +191,15 @@ import Cardano.Wallet.Primitive.Types
     , TxParameters (getTokenBundleMaxSize)
     )
 import Cardano.Wallet.Unsafe
-    ( unsafeDeserialiseCbor, unsafeMkPercentage )
+    ( unsafeIntToWord, unsafeMkPercentage )
+import Cardano.Wallet.Util
+    ( internalError, tina )
 import Codec.Binary.Bech32
     ( dataPartFromBytes, dataPartToBytes )
 import Control.Applicative
-    ( (<|>) )
+    ( Const (..), (<|>) )
 import Control.Arrow
     ( left )
-import Control.Exception
-    ( ErrorCall, displayException )
 import Control.Monad
     ( when, (>=>) )
 import Crypto.Hash.Utils
@@ -202,13 +223,11 @@ import Data.ByteString.Short
 import Data.Coerce
     ( coerce )
 import Data.Foldable
-    ( asum, toList )
-import Data.List
-    ( isPrefixOf )
+    ( toList )
 import Data.Map.Strict
     ( Map )
 import Data.Maybe
-    ( fromMaybe, isJust, mapMaybe )
+    ( isJust, mapMaybe )
 import Data.Proxy
     ( Proxy (..) )
 import Data.Quantity
@@ -217,12 +236,14 @@ import Data.Text
     ( Text )
 import Data.Text.Class
     ( TextDecodingError (..) )
-import Data.Typeable
-    ( Typeable, typeRep )
+import Data.Tuple.Extra
+    ( fst3 )
+import Data.Type.Equality
+    ( (:~:) (..), testEquality )
 import Data.Word
     ( Word16, Word32, Word64, Word8 )
 import Fmt
-    ( Buildable (..), Builder, fmt, (+|), (+||), (|+), (||+) )
+    ( Buildable (..), Builder, (+|), (+||), (||+) )
 import GHC.Records
     ( HasField (..) )
 import GHC.Stack
@@ -234,8 +255,6 @@ import Numeric.Natural
 import Ouroboros.Consensus.Cardano.Block
     ( CardanoBlock
     , CardanoEras
-    , CardanoGenTx
-    , GenTx (..)
     , HardForkBlock (..)
     , StandardAlonzo
     , StandardShelley
@@ -256,7 +275,7 @@ import Ouroboros.Network.NodeToClient
     ( ConnectionId (..)
     , LocalAddress (..)
     , NodeToClientVersion (..)
-    , NodeToClientVersionData (..)
+    , NodeToClientVersionData
     )
 import Ouroboros.Network.Point
     ( WithOrigin (..) )
@@ -274,9 +293,11 @@ import qualified Cardano.Ledger.Address as SL
 import qualified Cardano.Ledger.Alonzo as Alonzo
 import qualified Cardano.Ledger.Alonzo.Data as Alonzo
 import qualified Cardano.Ledger.Alonzo.PParams as Alonzo
+import qualified Cardano.Ledger.Alonzo.Scripts as Alonzo
 import qualified Cardano.Ledger.Alonzo.Tx as Alonzo
 import qualified Cardano.Ledger.Alonzo.TxBody as Alonzo
 import qualified Cardano.Ledger.Alonzo.TxSeq as Alonzo
+import qualified Cardano.Ledger.BaseTypes as Ledger
 import qualified Cardano.Ledger.BaseTypes as SL
 import qualified Cardano.Ledger.Core as SL.Core
 import qualified Cardano.Ledger.Credential as SL
@@ -300,7 +321,6 @@ import qualified Cardano.Wallet.Primitive.Types.Tx as W
 import qualified Codec.Binary.Bech32 as Bech32
 import qualified Codec.Binary.Bech32.TH as Bech32
 import qualified Codec.CBOR.Decoding as CBOR
-import qualified Codec.CBOR.Write as CBOR
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
@@ -592,6 +612,7 @@ fromShelleyPParams eraInfo pp = W.ProtocolParameters
     , stakeKeyDeposit = stakeKeyDepositFromPParams pp
     , eras = fromBound <$> eraInfo
     , maximumCollateralInputCount = minBound
+    , executionUnitPrices = Nothing
     }
   where
     fromBound (Bound _relTime _slotNo (EpochNo e)) =
@@ -616,6 +637,8 @@ fromAlonzoPParams eraInfo pp = W.ProtocolParameters
     , eras = fromBound <$> eraInfo
     , maximumCollateralInputCount = unsafeIntToWord $
         Alonzo._maxCollateralInputs pp
+    , executionUnitPrices =
+        Just $ executionUnitPricesFromPParams pp
     }
   where
     fromBound (Bound _relTime _slotNo (EpochNo e)) =
@@ -650,6 +673,29 @@ decentralizationLevelFromPParams pp =
         $ invertUnitInterval d
   where
     d = getField @"_d" pp
+
+executionUnitPricesFromPParams
+    :: HasField "_prices" pparams Alonzo.Prices
+    => pparams
+    -> W.ExecutionUnitPrices
+executionUnitPricesFromPParams pp =
+    fromAlonzoPrices prices
+  where
+    prices = getField @"_prices" pp
+    fromAlonzoPrices (Alonzo.Prices prSteps prMem) =
+        W.ExecutionUnitPrices
+        { W.priceExecutionSteps  = Ledger.unboundRational prSteps
+        , W.priceExecutionMemory = Ledger.unboundRational prMem
+        }
+
+fromLedgerExUnits
+    :: Alonzo.ExUnits
+    -> W.ExecutionUnits
+fromLedgerExUnits (Alonzo.ExUnits mem steps) =
+    W.ExecutionUnits
+    { executionSteps = steps
+    , executionMemory = mem
+    }
 
 txParametersFromPParams
     :: HasField "_minfeeA" pparams Natural
@@ -695,6 +741,19 @@ slottingParametersFromGenesis g =
         , getSecurityParameter =
             Quantity . fromIntegral . sgSecurityParam $ g
         }
+
+-- note: upcasts Word32 -> Word64
+getCardanoEpochSlots :: W.SlottingParameters -> Cardano.EpochSlots
+getCardanoEpochSlots =
+    Cardano.EpochSlots . fromIntegral . W.unEpochLength . W.getEpochLength
+
+localNodeConnectInfo
+    :: W.SlottingParameters
+    -> NetworkId
+    -> CardanoNodeConn
+    -> LocalNodeConnectInfo CardanoMode
+localNodeConnectInfo sp net = LocalNodeConnectInfo params net . nodeSocketFile
+    where params = CardanoModeParams (getCardanoEpochSlots sp)
 
 -- | Convert genesis data into blockchain params and an initial set of UTxO
 fromGenesisData
@@ -757,6 +816,7 @@ fromGenesisData g initialFunds =
                 ]
             , withdrawals = mempty
             , metadata = Nothing
+            , scriptValidity = Nothing
             }
           where
             W.TxIn pseudoHash _ = fromShelleyTxIn $
@@ -843,6 +903,15 @@ toShelleyCoin (W.Coin c) = SL.Coin $ safeCast c
     safeCast :: Word64 -> Integer
     safeCast = fromIntegral
 
+fromCardanoTx :: Cardano.Tx era -> W.Tx
+fromCardanoTx = \case
+    Cardano.ShelleyTx era tx -> case era of
+        Cardano.ShelleyBasedEraShelley -> fst3 $ fromShelleyTx tx
+        Cardano.ShelleyBasedEraAllegra -> fst3 $ fromAllegraTx tx
+        Cardano.ShelleyBasedEraMary    -> fst3 $ fromMaryTx tx
+        Cardano.ShelleyBasedEraAlonzo  -> fst3 $ fromAlonzoTx tx
+    Cardano.ByronTx tx                 -> fromTxAux tx
+
 -- NOTE: For resolved inputs we have to pass in a dummy value of 0.
 fromShelleyTx
     :: SLAPI.Tx (Cardano.ShelleyLedgerEra ShelleyEra)
@@ -866,6 +935,8 @@ fromShelleyTx tx =
             fromShelleyWdrl wdrls
         , metadata =
             fromShelleyMD <$> SL.strictMaybeToMaybe mmd
+        , scriptValidity =
+            Nothing
         }
     , mapMaybe fromShelleyDelegationCert (toList certs)
     , mapMaybe fromShelleyRegistrationCert (toList certs)
@@ -896,6 +967,8 @@ fromAllegraTx tx =
             fromShelleyWdrl wdrls
         , metadata =
             fromShelleyMD . toSLMetadata <$> SL.strictMaybeToMaybe mmd
+        , scriptValidity =
+            Nothing
         }
     , mapMaybe fromShelleyDelegationCert (toList certs)
     , mapMaybe fromShelleyRegistrationCert (toList certs)
@@ -930,6 +1003,8 @@ fromMaryTx tx =
             fromShelleyWdrl wdrls
         , metadata =
             fromShelleyMD . toSLMetadata <$> SL.strictMaybeToMaybe mad
+        , scriptValidity =
+            Nothing
         }
     , mapMaybe fromShelleyDelegationCert (toList certs)
     , mapMaybe fromShelleyRegistrationCert (toList certs)
@@ -974,6 +1049,8 @@ fromAlonzoTxBodyAndAux bod mad =
             fromShelleyWdrl wdrls
         , metadata =
             fromShelleyMD . toSLMetadata <$> SL.strictMaybeToMaybe mad
+        , scriptValidity =
+            Nothing
         }
     , mapMaybe fromShelleyDelegationCert (toList certs)
     , mapMaybe fromShelleyRegistrationCert (toList certs)
@@ -1019,8 +1096,14 @@ fromAlonzoTx
        , [W.DelegationCertificate]
        , [W.PoolCertificate]
        )
-fromAlonzoTx (Alonzo.ValidatedTx bod _wits _isValidating aux) =
-    fromAlonzoTxBodyAndAux bod aux
+fromAlonzoTx (Alonzo.ValidatedTx bod _wits (Alonzo.IsValid isValid) aux) =
+    (\(tx, d, p) -> (tx { W.scriptValidity = validity }, d, p))
+    $ fromAlonzoTxBodyAndAux bod aux
+    where
+        validity =
+            if isValid
+            then Just W.TxScriptValid
+            else Just W.TxScriptInvalid
 
 fromCardanoValue :: HasCallStack => Cardano.Value -> TokenBundle.TokenBundle
 fromCardanoValue = uncurry TokenBundle.fromFlatList . extract
@@ -1114,52 +1197,11 @@ toWalletCoin = W.Coin . unsafeCoinToWord64
 unsafeCoinToWord64 :: HasCallStack => SL.Coin -> Word64
 unsafeCoinToWord64 (SL.Coin c) = unsafeIntToWord c
 
--- | Convert an integer type of any range to a machine word.
---
--- Only use it for values which have come from the ledger, and should fit in the
--- given type, according to the spec.
---
--- If this conversion would under/overflow, there is not much we can do except
--- to hastily exit.
-unsafeIntToWord
-    :: forall from to
-     . ( HasCallStack
-       , Integral from
-       , Bounded to
-       , Integral to
-       , Typeable from
-       , Typeable to
-       , Show from)
-    => from -> to
-unsafeIntToWord n
-    | n < fromIntegral (minBound :: to) = crash "underflow"
-    | n > fromIntegral (maxBound :: to) = crash "overflow"
-    | otherwise = fromIntegral n
-  where
-    crash :: Builder -> to
-    crash err = internalError $ err |+" converting value "+|| n ||+
-        " from " +|| typeRep (Proxy @from) ||+
-        " to "+|| typeRep (Proxy @to) ||+"!"
-
--- | Calls the 'error' function, which will usually crash the program.
-internalError :: HasCallStack => Builder -> a
-internalError msg = error $ fmt $ "INTERNAL ERROR: "+|msg
-
--- | Tests whether an 'Exception' was caused by 'internalError'.
-isInternalError :: ErrorCall -> Bool
-isInternalError e = "INTERNAL ERROR" `isPrefixOf` displayException e
-
--- | Take the first 'Just' from a list of 'Maybe', or die trying.
--- There is no alternative.
-tina :: HasCallStack => Builder -> [Maybe a] -> a
-tina msg = fromMaybe (internalError msg) . asum
-
 fromPoolMetadata :: SL.PoolMetadata -> (W.StakePoolMetadataUrl, W.StakePoolMetadataHash)
 fromPoolMetadata meta =
     ( W.StakePoolMetadataUrl (urlToText (SL._poolMDUrl meta))
     , W.StakePoolMetadataHash (SL._poolMDHash meta)
     )
-
 
 -- | Convert a stake credentials to a 'RewardAccount' type.
 --
@@ -1187,41 +1229,6 @@ fromUnitInterval x =
   where
     bomb = internalError $
         "fromUnitInterval: encountered invalid parameter value: "+||x||+""
-
--- | SealedTx are the result of rightfully constructed shelley transactions so, it
--- is relatively safe to unserialize them from CBOR.
-unsealShelleyTx
-    :: (HasCallStack, O.ShelleyBasedEra (era c))
-    => (GenTx (ShelleyBlock (era c)) -> CardanoGenTx c)
-    -> W.SealedTx
-    -> CardanoGenTx c
-unsealShelleyTx wrap = wrap
-    . unsafeDeserialiseCbor fromCBOR
-    . BL.fromStrict
-    . W.getSealedTx
-
-sealShelleyTx
-    :: forall era b c. (O.ShelleyBasedEra (Cardano.ShelleyLedgerEra era))
-    => (SL.Core.Tx (Cardano.ShelleyLedgerEra era) -> (W.Tx, b, c))
-    -> Cardano.Tx era
-    -> (W.Tx, W.SealedTx)
-sealShelleyTx fromTx (Cardano.ShelleyTx _era tx) =
-    let
-        -- The Cardano.Tx GADT won't allow the Shelley crypto type param escape,
-        -- so we convert directly to the concrete wallet Tx type:
-        (walletTx, _, _) = fromTx tx
-        sealed = serialize' $ O.mkShelleyTx tx
-    in
-        (walletTx, W.SealedTx sealed)
-
--- Needed to compile, but in principle should never be called.
-sealShelleyTx _ (Cardano.ByronTx txaux) =
-    let
-        tx = fromTxAux txaux
-        inps = fst <$> W.resolvedInputs tx
-        outs = W.outputs tx
-    in
-        (tx, W.SealedTx $ CBOR.toStrictByteString $ CBOR.encodeTx (inps, outs))
 
 toCardanoTxId :: W.Hash "Tx" -> Cardano.TxId
 toCardanoTxId (W.Hash h) = Cardano.TxId $ UnsafeHash $ toShort h
@@ -1382,6 +1389,61 @@ rewardAccountFromAddress (W.Address bytes) = refToAccount . ref =<< parseAddr by
     refToAccount (SL.StakeRefBase cred) = Just $ fromStakeCredential cred
     refToAccount (SL.StakeRefPtr _) = Nothing
     refToAccount SL.StakeRefNull = Nothing
+
+-- | Converts 'SealedTx' to something that can be submitted with the
+-- 'Cardano.Api' local tx submission client.
+unsealShelleyTx :: W.SealedTx -> TxInMode CardanoMode
+unsealShelleyTx wtx = case W.cardanoTx wtx of
+    Cardano.InAnyCardanoEra ByronEra tx ->
+        TxInMode tx ByronEraInCardanoMode
+    Cardano.InAnyCardanoEra ShelleyEra tx ->
+        TxInMode tx ShelleyEraInCardanoMode
+    Cardano.InAnyCardanoEra AllegraEra tx ->
+        TxInMode tx AllegraEraInCardanoMode
+    Cardano.InAnyCardanoEra MaryEra tx ->
+        TxInMode tx MaryEraInCardanoMode
+    Cardano.InAnyCardanoEra AlonzoEra tx ->
+        TxInMode tx AlonzoEraInCardanoMode
+
+-- | Converts a 'ShelleyBasedEra' to the broader 'CardanoEra'.
+shelleyBasedToCardanoEra :: ShelleyBasedEra era -> CardanoEra era
+shelleyBasedToCardanoEra Cardano.ShelleyBasedEraShelley = ShelleyEra
+shelleyBasedToCardanoEra Cardano.ShelleyBasedEraAllegra = AllegraEra
+shelleyBasedToCardanoEra Cardano.ShelleyBasedEraMary    = MaryEra
+shelleyBasedToCardanoEra Cardano.ShelleyBasedEraAlonzo  = AlonzoEra
+
+-- | An existential type like 'AnyCardanoEra', but for 'ShelleyBasedEra'.
+data AnyShelleyBasedEra where
+     AnyShelleyBasedEra :: IsShelleyBasedEra era -- Provide class constraint
+                        => ShelleyBasedEra era   -- and explicit value.
+                        -> AnyShelleyBasedEra    -- and that's it.
+
+instance Show AnyShelleyBasedEra where
+    show (AnyShelleyBasedEra era) = "AnyShelleyBasedEra " ++ show era
+
+anyShelleyBasedEra :: InAnyShelleyBasedEra (Const ()) -> AnyShelleyBasedEra
+anyShelleyBasedEra (InAnyShelleyBasedEra era _) = AnyShelleyBasedEra era
+
+shelleyToCardanoEra :: AnyShelleyBasedEra -> AnyCardanoEra
+shelleyToCardanoEra (AnyShelleyBasedEra era) =
+    AnyCardanoEra (shelleyBasedToCardanoEra era)
+
+getShelleyBasedEra :: AnyCardanoEra -> Maybe AnyShelleyBasedEra
+getShelleyBasedEra (AnyCardanoEra e) = case cardanoEraStyle e of
+    LegacyByronEra -> Nothing
+    ShelleyBasedEra era -> Just
+        (anyShelleyBasedEra (InAnyShelleyBasedEra era (Const ())))
+
+instance (forall era. IsCardanoEra era => Show (thing era)) =>
+    Show (InAnyCardanoEra thing) where
+    show (InAnyCardanoEra era thing) =
+        "InAnyCardanoEra " ++ show era ++ " (" ++ show thing ++ ")"
+
+instance (forall era. IsCardanoEra era => Eq (thing era)) =>
+    Eq (InAnyCardanoEra thing) where
+    InAnyCardanoEra e1 a == InAnyCardanoEra e2 b = case testEquality e1 e2 of
+        Just Refl -> a == b
+        Nothing -> False
 
 {-------------------------------------------------------------------------------
                    Assessing sizes of token bundles

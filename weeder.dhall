@@ -9,13 +9,17 @@
   , "^Cardano\\.Wallet\\.Api\\.Client\\.byron(Address|Transaction|Wallet)Client\$"
   , "^Cardano\\.Wallet\\.Api\\.Link\\.(mintBurnAssets|patchSharedWallet|postExternalTransaction)\$"
   , "^Cardano\\.Wallet\\.DB\\.Sqlite\\.Types\\.sqlSettings'\$"
+  , "^Cardano\\.Wallet\\.Logging\\.traceWithExceptT\$"
+  , "^Cardano\\.Wallet\\.Primitive\\.CoinSelection\\.Gen\\."
   , "^Cardano\\.Wallet\\.Primitive\\.Types.\\stabilityWindow(Byron|Shelley)\$"
+  , "^Cardano\\.Wallet\\.Primitive\\.Types\\.UTxO\\.empty\$"
   , "^Cardano\\.Wallet\\.Unsafe\\."
   , "^Cardano\\.Wallet\\.Version\\.TH\\.gitRevFromGit\$"
   , "^Data\\.Set\\.Strict\\.NonEmptySet\\."
   , "^UnliftIO\\.Compat\\.mkRetryHandler\$"
   , "^Spec\\.main\$"
   , "^Test\\..*\\.spec\$"
+  , "^Test\\.QuickCheck\\.Extra\\.liftShrink3\$"
   , "^Test\\.Utils\\.Paths\\.getTestData"
   , "^Cardano\\.Wallet\\.Api\\.Malformed\\."
   , "^Cardano\\.Wallet\\.DB\\.StateMachine\\.showLabelledExamples\$"
@@ -30,6 +34,10 @@
   , "^Cardano\\.Wallet\\.Shelley\\.Compatibility\\.toCardanoHash\$"
   , "^Cardano\\.Wallet\\.Shelley\\.Launch\\.Cluster\\.singleNodeParams\$"
   , "^Cardano\\.Wallet\\.Shelley\\.Launch\\.Cluster\\.tokenMetadataServerFromEnv\$"
+  -- TODO: [ADP-919] Temporary weeder roots
+  , "signTransaction"
+  , "getSealedTxWitnesses"
+  , "getSerialisedTxParts"
   ]
 , type-class-roots = True
 }

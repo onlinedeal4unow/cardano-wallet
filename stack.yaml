@@ -48,9 +48,11 @@ ghc-options:
 
 nix:
   shell-file: nix/stack-shell.nix
-  # Disabling the pure nix-shell allows environment variables to be
-  # passed down to tests. We need this for integration tests.
-  pure: false
+  # NOTE: Using a pure nix-shell (the default setting in Stack)
+  # prevents environment variables from being passed down to tests.
+  # If an environment variable needs to be set, add --env VAR=VAL
+  # options on the test suite command line.
+  pure: true
 
 # This completely disables checking of Cabal file version bounds, and
 # is necessary for Stack to successfully construct its build plan.
@@ -67,9 +69,9 @@ extra-deps:
 - hspec-core-2.8.2
 - hspec-discover-2.8.2
 
-# cardano-addresses-3.5.0
+# cardano-addresses-3.6.0
 - git: https://github.com/input-output-hk/cardano-addresses
-  commit: 46ce81050f4015abd40c6bdf0a1ed30fa54e375a
+  commit: 4003fc09780da61bc09d85337bdd4c7664aa49ba
   subdirs:
     - command-line
     - core

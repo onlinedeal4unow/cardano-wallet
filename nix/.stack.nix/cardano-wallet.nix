@@ -11,7 +11,7 @@
     flags = { release = false; };
     package = {
       specVersion = "1.10";
-      identifier = { name = "cardano-wallet"; version = "2021.8.27"; };
+      identifier = { name = "cardano-wallet"; version = "2021.9.9"; };
       license = "Apache-2.0";
       copyright = "2020 IOHK";
       maintainer = "operations@iohk.io";
@@ -154,6 +154,7 @@
             (hsPkgs."cardano-ledger-core" or (errorHandler.buildDepError "cardano-ledger-core"))
             (hsPkgs."cardano-wallet" or (errorHandler.buildDepError "cardano-wallet"))
             (hsPkgs."cardano-wallet-core" or (errorHandler.buildDepError "cardano-wallet-core"))
+            (hsPkgs."cardano-wallet-launcher" or (errorHandler.buildDepError "cardano-wallet-launcher"))
             (hsPkgs."cardano-wallet-test-utils" or (errorHandler.buildDepError "cardano-wallet-test-utils"))
             (hsPkgs."containers" or (errorHandler.buildDepError "containers"))
             (hsPkgs."contra-tracer" or (errorHandler.buildDepError "contra-tracer"))

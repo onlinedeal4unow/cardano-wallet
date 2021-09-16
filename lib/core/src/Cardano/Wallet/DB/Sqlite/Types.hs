@@ -5,6 +5,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
+
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- |
@@ -71,7 +72,14 @@ import Cardano.Wallet.Primitive.Types.TokenPolicy
 import Cardano.Wallet.Primitive.Types.TokenQuantity
     ( TokenQuantity (..) )
 import Cardano.Wallet.Primitive.Types.Tx
-    ( Direction (..), SealedTx (..), TxMetadata, TxStatus (..) )
+    ( Direction (..)
+    , SealedTx (..)
+    , TxMetadata
+    , TxScriptValidity (..)
+    , TxStatus (..)
+    , persistSealedTx
+    , unPersistSealedTx
+    )
 import Control.Arrow
     ( left )
 import Control.Monad
@@ -445,8 +453,8 @@ instance PersistFieldSql TxMetadata where
 -- SealedTx - store the serialised tx as a binary blob
 
 instance PersistField SealedTx where
-    toPersistValue = toPersistValue . getSealedTx
-    fromPersistValue = fmap SealedTx . fromPersistValue
+    toPersistValue = toPersistValue . persistSealedTx
+    fromPersistValue = fromPersistValue >=> unPersistSealedTx
 
 instance PersistFieldSql SealedTx where
     sqlType _ = sqlType (Proxy @ByteString)
@@ -740,9 +748,6 @@ instance PersistField RewardAccount where
 instance PersistFieldSql RewardAccount where
     sqlType _ = sqlType (Proxy @Text)
 
-instance Read RewardAccount where
-    readsPrec _ = error "readsPrec stub needed for persistent"
-
 instance ToHttpApiData RewardAccount where
     toUrlPiece = toText
 
@@ -797,6 +802,27 @@ instance PersistField DerivationPrefix where
 
 instance PersistFieldSql DerivationPrefix where
     sqlType _ = sqlType (Proxy @Text)
+
+----------------------------------------------------------------------------
+-- ScriptValidation
+
+instance PersistField TxScriptValidity where
+    toPersistValue = \case
+        TxScriptValid -> PersistBool True
+        TxScriptInvalid -> PersistBool False
+
+    fromPersistValue = \case
+        PersistBool True -> Right TxScriptValid
+        PersistBool False -> Right TxScriptInvalid
+        x -> Left $ T.unwords
+            [ "Failed to parse Haskell type `TxScriptValidity`;"
+            , "expected null or boolean"
+            , "from database, but received:"
+            , T.pack (show x)
+            ]
+
+instance PersistFieldSql TxScriptValidity where
+    sqlType _ = sqlType (Proxy @(Maybe Bool))
 
 ----------------------------------------------------------------------------
 -- Other

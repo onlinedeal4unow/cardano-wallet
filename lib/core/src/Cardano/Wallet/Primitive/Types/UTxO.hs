@@ -29,8 +29,10 @@ module Cardano.Wallet.Primitive.Types.UTxO
     , balance
     , computeStatistics
     , computeUtxoStatistics
+    , difference
     , excluding
     , isSubsetOf
+    , empty
     , null
     , log10
     , restrictedBy
@@ -118,6 +120,9 @@ balance =
     fn :: TokenBundle -> TxOut -> TokenBundle
     fn tot out = tot `TB.add` view #tokens out
 
+difference :: UTxO -> UTxO -> UTxO
+difference a b = a `excluding` Map.keysSet (unUTxO b)
+
 -- | ins⋪ u
 excluding :: UTxO -> Set TxIn ->  UTxO
 excluding (UTxO utxo) =
@@ -137,6 +142,9 @@ restrictedBy (UTxO utxo) =
 restrictedTo :: UTxO -> Set TxOut -> UTxO
 restrictedTo (UTxO utxo) outs =
     UTxO $ Map.filter (`Set.member` outs) utxo
+
+empty :: UTxO
+empty = UTxO Map.empty
 
 null :: UTxO -> Bool
 null (UTxO u) = Map.null u

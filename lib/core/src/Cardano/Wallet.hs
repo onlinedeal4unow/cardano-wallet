@@ -136,10 +136,7 @@ module Cardano.Wallet
     , quitStakePool
     , guardJoin
     , guardQuit
-    , ErrJoinStakePool (..)
-    , ErrCannotJoin (..)
-    , ErrQuitStakePool (..)
-    , ErrCannotQuit (..)
+    , ErrStakePoolDelegation (..)
 
     -- ** Fee Estimation
     , FeeEstimation (..)
@@ -156,16 +153,15 @@ module Cardano.Wallet
     , LocalTxSubmissionConfig (..)
     , defaultLocalTxSubmissionConfig
     , runLocalTxSubmissionPool
-    , ErrMkTx (..)
+    , ErrMkTransaction (..)
     , ErrSubmitTx (..)
-    , ErrSubmitExternalTx (..)
     , ErrRemoveTx (..)
     , ErrPostTx (..)
-    , ErrDecodeSignedTx (..)
     , ErrListTransactions (..)
     , ErrGetTransaction (..)
     , ErrNoSuchTransaction (..)
     , ErrStartTimeLaterThanEndTime (..)
+    , ErrWitnessTx (..)
 
     -- ** Root Key
     , withRootKey
@@ -220,7 +216,14 @@ import Cardano.Wallet.DB
     , sparseCheckpoints
     )
 import Cardano.Wallet.Logging
-    ( BracketLog, bracketTracer, traceWithExceptT, unliftIOTracer )
+    ( BracketLog
+    , BracketLog' (..)
+    , bracketTracer
+    , formatResultMsg
+    , resultSeverity
+    , traceResult
+    , unliftIOTracer
+    )
 import Cardano.Wallet.Network
     ( ErrPostTx (..)
     , FollowAction (..)
@@ -369,8 +372,6 @@ import Cardano.Wallet.Primitive.Types.Tx
     ( Direction (..)
     , LocalTxSubmissionStatus
     , SealedTx (..)
-    , SerialisedTx (..)
-    , SerialisedTxParts (..)
     , TransactionInfo (..)
     , Tx
     , TxChange (..)
@@ -390,8 +391,10 @@ import Cardano.Wallet.Primitive.Types.UTxOIndex
     ( UTxOIndex )
 import Cardano.Wallet.Transaction
     ( DelegationAction (..)
-    , ErrDecodeSignedTx (..)
-    , ErrMkTx (..)
+    , ErrCannotJoin (..)
+    , ErrCannotQuit (..)
+    , ErrMkTransaction (..)
+    , ErrSignTx (..)
     , TransactionCtx (..)
     , TransactionLayer (..)
     , Withdrawal (..)
@@ -465,6 +468,8 @@ import Data.Quantity
     ( Quantity (..) )
 import Data.Set
     ( Set )
+import Data.Text
+    ( Text )
 import Data.Text.Class
     ( ToText (..) )
 import Data.Time.Clock
@@ -476,7 +481,18 @@ import Data.Void
 import Data.Word
     ( Word64 )
 import Fmt
-    ( blockListF, pretty, (+|), (+||), (|+), (||+) )
+    ( Buildable
+    , blockListF
+    , blockMapF
+    , build
+    , nameF
+    , pretty
+    , unlinesF
+    , (+|)
+    , (+||)
+    , (|+)
+    , (||+)
+    )
 import GHC.Generics
     ( Generic )
 import Safe
@@ -556,7 +572,7 @@ data WalletLayer m s (k :: Depth -> Type -> Type)
         (Tracer m WalletWorkerLog)
         (Block, NetworkParameters, SyncTolerance)
         (NetworkLayer m Block)
-        (TransactionLayer k)
+        (TransactionLayer k SealedTx)
         (DBLayer m s k)
     deriving (Generic)
 
@@ -600,7 +616,7 @@ type HasLogger msg = HasType (Tracer IO msg)
 -- hides that choice, for some ease of use.
 type HasNetworkLayer m = HasType (NetworkLayer m Block)
 
-type HasTransactionLayer k = HasType (TransactionLayer k)
+type HasTransactionLayer k = HasType (TransactionLayer k SealedTx)
 
 dbLayer
     :: forall m s k ctx. HasDBLayer m s k ctx
@@ -628,9 +644,9 @@ networkLayer =
 
 transactionLayer
     :: forall k ctx. (HasTransactionLayer k ctx)
-    => Lens' ctx (TransactionLayer k)
+    => Lens' ctx (TransactionLayer k SealedTx)
 transactionLayer =
-    typed @(TransactionLayer k)
+    typed @(TransactionLayer k SealedTx)
 
 {-------------------------------------------------------------------------------
                                    Wallet
@@ -1559,40 +1575,16 @@ selectAssets ctx (utxoAvailable, cp, pending) txCtx outputs transform = do
         hasWithdrawal = not . null . withdrawals
 
 signTransaction
-    :: forall ctx s k.
-        ( HasTransactionLayer k ctx
-        , HasDBLayer IO s k ctx
-        , HasNetworkLayer IO ctx
-        , IsOwned s k
-        )
-    => ctx
+    :: ctx
     -> WalletId
     -> ((k 'RootK XPrv, Passphrase "encryption") -> (XPrv, Passphrase "encryption"))
        -- ^ Reward account derived from the root key (or somewhere else).
     -> Passphrase "raw"
-    -> ByteString
-    -> ExceptT ErrSignPayment IO SerialisedTxParts
-signTransaction ctx wid mkRwdAcct pwd txBody = db & \DBLayer{..} -> do
-    era <- liftIO $ currentNodeEra nl
-    let _decoded = decodeSignedTx tl era txBody
-    withRootKey @_ @s ctx wid pwd ErrSignPaymentWithRootKey $ \xprv scheme -> do
-        let pwdP = preparePassphrase scheme pwd
-        mapExceptT atomically $ do
-            cp <- withExceptT ErrSignPaymentNoSuchWallet $ withNoSuchWallet wid $
-                readCheckpoint wid
-
-            -- TODO: ADP-919 implement this
-            let _keyFrom = isOwned (getState cp) (xprv, pwdP)
-            let _rewardAcnt = mkRwdAcct (xprv, pwdP)
-            -- withExceptT ErrSignPaymentMkTx $ ExceptT $ pure $
-            --     witnessTransaction tl rewardAcnt keyFrom txBody
-            let tx = mempty
-            pure $ SerialisedTxParts tx txBody []
-
-  where
-    db = ctx ^. dbLayer @IO @s @k
-    tl = ctx ^. transactionLayer @k
-    nl = ctx ^. networkLayer
+    -> SealedTx
+    -> ExceptT ErrWitnessTx IO SealedTx
+signTransaction _ctx _wid _mkRwdAcct _pwd _tx =
+    -- TODO: [ADP-919] implement Wallet.signTransaction
+    throwE (ErrWitnessTxSignTx ErrSignTxUnimplemented)
 
 -- | Produce witnesses and construct a transaction from a given selection.
 --
@@ -1653,15 +1645,14 @@ constructTransaction
     -> WalletId
     -> TransactionCtx
     -> SelectionResult TxOut
-    -> ExceptT ErrConstructTx IO SerialisedTx
-constructTransaction ctx wid txCtx sel =
-    db & \DBLayer{..} -> do
+    -> ExceptT ErrConstructTx IO SealedTx
+constructTransaction ctx wid txCtx sel = db & \DBLayer{..} -> do
     era <- liftIO $ currentNodeEra nl
     (_, xpub, _) <- withExceptT ErrConstructTxReadRewardAccount $
         readRewardAccount @ctx @s @k @n ctx wid
     mapExceptT atomically $ do
         pp <- liftIO $ currentProtocolParameters nl
-        withExceptT ErrConstructTxMkTx $ ExceptT $ pure $
+        withExceptT ErrConstructTxBody $ ExceptT $ pure $
             mkUnsignedTransaction tl era xpub pp txCtx sel
   where
     db = ctx ^. dbLayer @IO @s @k
@@ -1755,8 +1746,8 @@ submitTx
     -> WalletId
     -> (Tx, TxMeta, SealedTx)
     -> ExceptT ErrSubmitTx IO ()
-submitTx ctx wid (tx, meta, binary) = db & \DBLayer{..} -> do
-    withExceptT ErrSubmitTxNetwork $ traceWithExceptT tr' $
+submitTx ctx wid (tx, meta, binary) = traceResult tr' $ db & \DBLayer{..} -> do
+    withExceptT ErrSubmitTxNetwork $
         postTx nw binary
     mapExceptT atomically $ do
         withExceptT ErrSubmitTxNoSuchWallet $
@@ -1768,7 +1759,7 @@ submitTx ctx wid (tx, meta, binary) = db & \DBLayer{..} -> do
     nw = ctx ^. networkLayer
 
     tr = ctx ^. logger
-    tr' = contramap (MsgWallet . MsgTxSubmit . MsgPostTxResult (tx ^. #txId)) tr
+    tr' = contramap (MsgWallet . MsgTxSubmit . MsgSubmitTx tx meta binary) tr
 
     handleLocalTxSubmissionErr = \case
         ErrPutLocalTxSubmissionNoSuchWallet e -> ErrSubmitTxNoSuchWallet e
@@ -1785,20 +1776,16 @@ submitExternalTx
         , HasLogger TxSubmitLog ctx
         )
     => ctx
-    -> ByteString
-    -> ExceptT ErrSubmitExternalTx IO Tx
-submitExternalTx ctx bytes = do
-    era <- liftIO $ currentNodeEra nw
-    (tx, binary) <- withExceptT ErrSubmitExternalTxDecode $ except $
-        decodeSignedTx tl era bytes
-    withExceptT ErrSubmitExternalTxNetwork $ traceResult (tx ^. #txId) $
-        postTx nw binary
-    return tx
+    -> SealedTx
+    -> ExceptT ErrPostTx IO Tx
+submitExternalTx ctx sealedTx = traceResult trPost $ do
+    postTx nw sealedTx
+    pure tx
   where
-    nw = ctx ^. networkLayer
     tl = ctx ^. transactionLayer @k
-    tr = ctx ^. logger
-    traceResult i = traceWithExceptT (contramap (MsgPostTxResult i) tr)
+    nw = ctx ^. networkLayer
+    trPost = contramap (MsgSubmitExternalTx (tx ^. #txId)) (ctx ^. logger)
+    tx = decodeTx tl sealedTx
 
 -- | Remove a pending or expired transaction from the transaction history. This
 -- happens at the request of the user. If the transaction is already on chain,
@@ -1874,8 +1861,8 @@ runLocalTxSubmissionPool cfg ctx wid = db & \DBLayer{..} -> do
         let sl = bh ^. #slotNo
         -- Re-submit transactions due, ignore errors
         forM_ (filter (isScheduled sp sl) pending) $ \st -> do
-            res <- runExceptT $ postTx nw (st ^. #submittedTx)
-            traceWith tr (MsgRetryPostTxResult (st ^. #txId) res)
+            _ <- runExceptT $ traceResult (trRetry (st ^. #txId)) $
+                postTx nw (st ^. #submittedTx)
             atomically $ runExceptT $ putLocalTxSubmission
                 wid
                 (st ^. #txId)
@@ -1894,6 +1881,7 @@ runLocalTxSubmissionPool cfg ctx wid = db & \DBLayer{..} -> do
     tr = unliftIOTracer $ contramap (MsgWallet . MsgTxSubmit) $
         ctx ^. logger @WalletWorkerLog
     trBracket = contramap MsgProcessPendingPool tr
+    trRetry i = contramap (MsgRetryPostTx i) tr
 
 -- | Return a function to run an action at most once every _interval_.
 throttle
@@ -2033,6 +2021,8 @@ migrationPlanToSelectionWithdrawals plan rewardWithdrawal outputAddressesToCycle
             , utxoRemaining = UTxOIndex.empty
             , extraCoinSource
             , changeGenerated = []
+            , assetsToMint = TokenMap.empty
+            , assetsToBurn = TokenMap.empty
             }
 
         -- NOTE:
@@ -2086,15 +2076,15 @@ joinStakePool
     -> PoolId
     -> PoolLifeCycleStatus
     -> WalletId
-    -> ExceptT ErrJoinStakePool IO (DelegationAction, Maybe Coin)
+    -> ExceptT ErrStakePoolDelegation IO (DelegationAction, Maybe Coin)
     -- ^ snd is the deposit
 joinStakePool ctx currentEpoch knownPools pid poolStatus wid =
     db & \DBLayer{..} -> do
         (walMeta, isKeyReg) <- mapExceptT atomically $ do
-            walMeta <- withExceptT ErrJoinStakePoolNoSuchWallet
+            walMeta <- withExceptT ErrStakePoolDelegationNoSuchWallet
                 $ withNoSuchWallet wid
                 $ readWalletMeta wid
-            isKeyReg <- withExceptT ErrJoinStakePoolNoSuchWallet
+            isKeyReg <- withExceptT ErrStakePoolDelegationNoSuchWallet
                 $ isStakeKeyRegistered wid
             pure (walMeta, isKeyReg)
 
@@ -2103,7 +2093,7 @@ joinStakePool ctx currentEpoch knownPools pid poolStatus wid =
         let retirementInfo =
                 PoolRetirementEpochInfo currentEpoch <$> mRetirementEpoch
 
-        withExceptT ErrJoinStakePoolCannotJoin $ except $
+        withExceptT ErrStakePoolJoin $ except $
             guardJoin knownPools (walMeta ^. #delegation) pid retirementInfo
 
         liftIO $ traceWith tr $ MsgIsStakeKeyRegistered isKeyReg
@@ -2126,17 +2116,17 @@ quitStakePool
         )
     => ctx
     -> WalletId
-    -> ExceptT ErrQuitStakePool IO DelegationAction
+    -> ExceptT ErrStakePoolDelegation IO DelegationAction
 quitStakePool ctx wid = db & \DBLayer{..} -> do
     walMeta <- mapExceptT atomically
-        $ withExceptT ErrQuitStakePoolNoSuchWallet
+        $ withExceptT ErrStakePoolDelegationNoSuchWallet
         $ withNoSuchWallet wid
         $ readWalletMeta wid
 
     rewards <- liftIO
         $ fetchRewardBalance @ctx @s @k ctx wid
 
-    withExceptT ErrQuitStakePoolCannotQuit $ except $
+    withExceptT ErrStakePoolQuit $ except $
         guardQuit (walMeta ^. #delegation) rewards
 
     pure Quit
@@ -2599,7 +2589,7 @@ newtype ErrListUTxOStatistics
 
 -- | Errors that can occur when signing a transaction.
 data ErrSignPayment
-    = ErrSignPaymentMkTx ErrMkTx
+    = ErrSignPaymentMkTx ErrMkTransaction
     | ErrSignPaymentNoSuchWallet ErrNoSuchWallet
     | ErrSignPaymentWithRootKey ErrWithRootKey
     | ErrSignPaymentIncorrectTTL PastHorizonException
@@ -2608,7 +2598,7 @@ data ErrSignPayment
 -- | Errors that can occur when constructing an unsigned transaction.
 data ErrConstructTx
     = ErrConstructTxWrongPayload
-    | ErrConstructTxMkTx ErrMkTx
+    | ErrConstructTxBody ErrMkTransaction
     | ErrConstructTxNoSuchWallet ErrNoSuchWallet
     | ErrConstructTxReadRewardAccount ErrReadRewardAccount
     | ErrConstructTxIncorrectTTL PastHorizonException
@@ -2621,18 +2611,19 @@ newtype ErrMintBurnAssets
       -- ^ Temporary error constructor.
     deriving (Show, Eq)
 
+-- | Errors that can occur when signing a transaction.
+data ErrWitnessTx
+    = ErrWitnessTxSignTx ErrSignTx
+    | ErrWitnessTxNoSuchWallet ErrNoSuchWallet
+    | ErrWitnessTxWithRootKey ErrWithRootKey
+    | ErrWitnessTxIncorrectTTL PastHorizonException
+    deriving (Show, Eq)
+
 -- | Errors that can occur when submitting a signed transaction to the network.
 data ErrSubmitTx
     = ErrSubmitTxNetwork ErrPostTx
     | ErrSubmitTxNoSuchWallet ErrNoSuchWallet
     | ErrSubmitTxImpossible ErrNoSuchTransaction
-    deriving (Show, Eq)
-
--- | Errors that can occur when submitting an externally-signed transaction
---   to the network.
-data ErrSubmitExternalTx
-    = ErrSubmitExternalTxNetwork ErrPostTx
-    | ErrSubmitExternalTxDecode ErrDecodeSignedTx
     deriving (Show, Eq)
 
 -- | Errors that can occur when trying to change a wallet's passphrase.
@@ -2681,15 +2672,10 @@ data ErrSelectAssets
     | ErrSelectAssetsSelectionError SelectionError
     deriving (Generic, Eq, Show)
 
-data ErrJoinStakePool
-    = ErrJoinStakePoolNoSuchWallet ErrNoSuchWallet
-    | ErrJoinStakePoolCannotJoin ErrCannotJoin
-    deriving (Generic, Eq, Show)
-
-data ErrQuitStakePool
-    = ErrQuitStakePoolNoSuchWallet ErrNoSuchWallet
-    | ErrQuitStakePoolCannotQuit ErrCannotQuit
-    deriving (Generic, Eq, Show)
+data ErrStakePoolDelegation
+    = ErrStakePoolDelegationNoSuchWallet ErrNoSuchWallet
+    | ErrStakePoolJoin ErrCannotJoin
+    | ErrStakePoolQuit ErrCannotQuit
 
 -- | Errors that can occur when fetching the reward balance of a wallet
 newtype ErrFetchRewards
@@ -2702,16 +2688,6 @@ data ErrCheckWalletIntegrity
     deriving (Eq, Show)
 
 instance Exception ErrCheckWalletIntegrity
-
-data ErrCannotJoin
-    = ErrAlreadyDelegating PoolId
-    | ErrNoSuchPool PoolId
-    deriving (Generic, Eq, Show)
-
-data ErrCannotQuit
-    = ErrNotDelegatingOrAboutTo
-    | ErrNonNullRewards Coin
-    deriving (Generic, Eq, Show)
 
 -- | Can't perform given operation because the wallet died.
 newtype ErrWalletNotResponding
@@ -2940,30 +2916,63 @@ instance HasSeverityAnnotation WalletLog where
         MsgIsStakeKeyRegistered _ -> Info
 
 data TxSubmitLog
-    = MsgPostTxResult (Hash "Tx") (Either ErrPostTx ())
-    | MsgRetryPostTxResult (Hash "Tx") (Either ErrPostTx ())
+    = MsgSubmitTx Tx TxMeta SealedTx (BracketLog' (Either ErrSubmitTx ()))
+    | MsgSubmitExternalTx (Hash "Tx") (BracketLog' (Either ErrPostTx Tx))
+    | MsgRetryPostTx (Hash "Tx") (BracketLog' (Either ErrPostTx ()))
     | MsgProcessPendingPool BracketLog
     deriving (Show, Eq)
 
-instance ToText TxSubmitLog where
-    toText = \case
-        MsgPostTxResult txid res ->
-            "Transaction " <> pretty txid <> " " <> case res of
-                Right _ -> "accepted by local node"
-                Left err -> "failed: " <> toText err
-        MsgRetryPostTxResult txid res ->
-            "Transaction " <> pretty txid <>
-            " resubmitted to local node and " <> case res of
-                Right _ -> "accepted again"
-                Left _ -> "not accepted (this is expected)"
+instance ToText TxSubmitLog
+
+instance Buildable TxSubmitLog where
+    build = \case
+        MsgSubmitTx tx meta sealed msg -> case msg of
+            BracketStart -> unlinesF
+                [ "Submitting transaction "+|tx ^. #txId|+" to local node"
+                , blockMapF
+                    [ ("Tx" :: Text, build tx)
+                    , ("SealedTx", build sealed)
+                    , ("TxMeta", build meta) ]
+                ]
+            BracketFinish res ->
+                "Transaction "+|tx ^. #txId|+" "+|case res of
+                    Right _ -> "accepted by local node"
+                    Left err -> "failed: "+||err||+""
+            _ -> formatResultMsg "submitTx" [("txid", tx ^. #txId)] msg
+
+        MsgSubmitExternalTx txid msg -> case msg of
+            BracketStart -> "Submitting external transaction "+|txid|+
+                " to local node..."
+            BracketFinish res ->
+                "Transaction "+|txid|+" "+|case res of
+                    Right tx -> unlinesF
+                        [ "accepted by local node"
+                        , nameF "tx" (build tx)
+                        ]
+                    Left err -> "failed: "+|toText err|+""
+            _ -> formatResultMsg "submitExternalTx" [("txid", txid)] msg
+
+        MsgRetryPostTx txid msg -> case msg of
+            BracketStart -> "Retrying submission of transaction "+|txid|+
+                " to local node..."
+            BracketFinish res ->
+                "Transaction "+|txid|+" resubmitted to local node and " <>
+                case res of
+                    Right _ -> "accepted again"
+                    Left _ -> "not accepted (this is expected)"
+            _ -> formatResultMsg "runLocalTxSubmissionPool(postTx)"
+                [("txid", txid)] msg
+
         MsgProcessPendingPool msg ->
-            "Processing the pending local tx submission pool: " <> toText msg
+            "Processing the pending local tx submission pool: "+|msg|+""
 
 instance HasPrivacyAnnotation TxSubmitLog
 instance HasSeverityAnnotation TxSubmitLog where
     getSeverityAnnotation = \case
-        MsgPostTxResult _ (Right _) -> Info
-        MsgPostTxResult _ (Left _) -> Error
-        MsgRetryPostTxResult _ (Right _) -> Info
-        MsgRetryPostTxResult _ (Left _) -> Debug
+        MsgSubmitTx _ _ _ b -> resultSeverity Info b
+        MsgSubmitExternalTx _ b -> resultSeverity Info b
+        MsgRetryPostTx _ b -> case b of
+            BracketFinish (Right _) -> Info
+            BracketException _ -> Error
+            _ -> Debug
         MsgProcessPendingPool msg -> getSeverityAnnotation msg

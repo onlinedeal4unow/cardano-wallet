@@ -137,7 +137,8 @@ import Test.Integration.Framework.DSL
     , (.>=)
     )
 import Test.Integration.Framework.TestData
-    ( errMsg403Fee
+    ( errMsg403EmptyUTxO
+    , errMsg403Fee
     , errMsg403NonNullReward
     , errMsg403NotDelegating
     , errMsg403NotEnoughMoney
@@ -291,7 +292,7 @@ spec = describe "SHELLEY_STAKE_POOLS" $ do
 
         -- cannot use rewards by default
         r1 <- request @(ApiTransaction n) ctx
-            (Link.createTransaction @'Shelley src)
+            (Link.createTransactionOld @'Shelley src)
             Default (Json payload)
         expectResponseCode HTTP.status202 r1
         eventually "Wallet has not consumed rewards" $ do
@@ -348,7 +349,7 @@ spec = describe "SHELLEY_STAKE_POOLS" $ do
 
         waitForNextEpoch ctx
         rTx <- request @(ApiTransaction n) ctx
-            (Link.createTransaction @'Shelley src)
+            (Link.createTransactionOld @'Shelley src)
             Default (Json payloadWithdrawal)
         verify rTx
             [ expectField #amount (.> (Quantity coin))
@@ -948,7 +949,7 @@ spec = describe "SHELLEY_STAKE_POOLS" $ do
 
             quitStakePool @n ctx (w, fixturePassphrase) >>= flip verify
                 [ expectResponseCode HTTP.status403
-                , expectErrorMessage errMsg403NotEnoughMoney
+                , expectErrorMessage errMsg403EmptyUTxO
                 ]
 
     it "STAKE_POOLS_ESTIMATE_FEE_01 - can estimate fees" $ \ctx -> runResourceT $ do
@@ -1293,7 +1294,7 @@ spec = describe "SHELLEY_STAKE_POOLS" $ do
                 }|]
 
         request @(ApiTransaction n) ctx
-            (Link.createTransaction @'Shelley w)
+            (Link.createTransactionOld @'Shelley w)
             Default (Json payload)
             >>= flip verify
                 [ expectResponseCode HTTP.status202 ]
@@ -1334,7 +1335,7 @@ spec = describe "SHELLEY_STAKE_POOLS" $ do
                 , "passphrase": #{fixturePassphrase}
                 }|]
         request @(ApiTransaction n) ctx
-            (Link.createTransaction @'Shelley w)
+            (Link.createTransactionOld @'Shelley w)
             Default (Json payload)
             >>= flip verify
                 [ expectResponseCode HTTP.status202 ]
